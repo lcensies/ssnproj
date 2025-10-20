@@ -6,6 +6,13 @@ import (
 	"errors"
 )
 
+// Custom error types for message deserialization
+var (
+	ErrMessageNotReady   = errors.New("message not ready")
+	ErrInsufficientData  = errors.New("insufficient data for message header")
+	ErrIncompletePayload = errors.New("incomplete message payload")
+)
+
 // MessageType represents the type of message
 type MessageType byte
 
@@ -108,6 +115,68 @@ func Deserialize(data []byte) (*Message, error) {
 		Type:    MessageType(msgType),
 		Payload: payload,
 	}, nil
+}
+
+// MessageBuffer handles partial message reading with proper buffering
+type MessageBuffer struct {
+	buffer []byte
+}
+
+// NewMessageBuffer creates a new message buffer
+func NewMessageBuffer() *MessageBuffer {
+	return &MessageBuffer{
+		buffer: make([]byte, 0),
+	}
+}
+
+// AddData adds new data to the buffer
+func (mb *MessageBuffer) AddData(data []byte) {
+	mb.buffer = append(mb.buffer, data...)
+}
+
+// TryDeserialize attempts to deserialize a complete message from the buffer
+// Returns the message and remaining buffer data if successful, or nil and error if not ready
+func (mb *MessageBuffer) TryDeserialize() (*Message, error) {
+	// Need at least 5 bytes (1 for type + 4 for length)
+	if len(mb.buffer) < 5 {
+		return nil, ErrInsufficientData
+	}
+
+	// Read payload length from the buffer
+	payloadLen := binary.BigEndian.Uint32(mb.buffer[1:5])
+
+	// Calculate total message length: 1 (type) + 4 (length) + payload
+	totalMessageLen := 5 + int(payloadLen)
+
+	// Check if we have the complete message
+	if len(mb.buffer) < totalMessageLen {
+		return nil, ErrIncompletePayload
+	}
+
+	// Extract the complete message
+	messageData := mb.buffer[:totalMessageLen]
+	remainingData := mb.buffer[totalMessageLen:]
+
+	// Deserialize the complete message
+	message, err := Deserialize(messageData)
+	if err != nil {
+		return nil, err
+	}
+
+	// Update buffer to contain only remaining data
+	mb.buffer = remainingData
+
+	return message, nil
+}
+
+// HasData returns true if there's data in the buffer
+func (mb *MessageBuffer) HasData() bool {
+	return len(mb.buffer) > 0
+}
+
+// Clear clears the buffer
+func (mb *MessageBuffer) Clear() {
+	mb.buffer = mb.buffer[:0]
 }
 
 // SerializeCommand serializes a command message
