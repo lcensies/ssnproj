@@ -8,11 +8,22 @@ import (
 	"io"
 	"net"
 	"os"
+	"time"
 
 	aesutil "github.com/lcensies/ssnproj/pkg/aes"
 	"github.com/lcensies/ssnproj/pkg/protocol"
 	rsautil "github.com/lcensies/ssnproj/pkg/rsa"
 	"go.uber.org/zap"
+)
+
+// Constants
+const (
+	// MaxPayloadSize is the maximum allowed payload size (4 GB)
+	// This prevents memory exhaustion attacks
+	MaxPayloadSize = (4 * 1024 * 1024 * 1024) - 1
+
+	// DefaultReadTimeout is the default timeout for read operations
+	DefaultReadTimeout = 30 * time.Second
 )
 
 // Error message constants
@@ -83,6 +94,11 @@ func (c *Client) ReceiveMessage() (*protocol.Message, error) {
 	// Read payload
 	msgType := protocol.MessageType(header[0])
 	payloadLen := binary.BigEndian.Uint32(header[1:5])
+
+	// Validate payload size to prevent memory exhaustion
+	if payloadLen > MaxPayloadSize {
+		return nil, fmt.Errorf("payload too large: %d bytes (max %d)", payloadLen, MaxPayloadSize)
+	}
 
 	payload := make([]byte, payloadLen)
 	if payloadLen > 0 {

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"io"
 )
 
 // Custom error types for message deserialization
@@ -235,7 +236,7 @@ func DeserializeCommand(data []byte) (*CommandMessage, error) {
 
 	// Read remaining data
 	remaining := make([]byte, buf.Len())
-	if _, err := buf.Read(remaining); err != nil && err.Error() != "EOF" {
+	if _, err := buf.Read(remaining); err != nil && err != io.EOF {
 		return nil, err
 	}
 
@@ -307,7 +308,7 @@ func DeserializeResponse(data []byte) (*ResponseMessage, error) {
 
 	// Read remaining data
 	remaining := make([]byte, buf.Len())
-	if _, err := buf.Read(remaining); err != nil && err.Error() != "EOF" {
+	if _, err := buf.Read(remaining); err != nil && err != io.EOF {
 		return nil, err
 	}
 
