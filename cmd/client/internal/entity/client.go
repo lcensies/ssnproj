@@ -1,0 +1,340 @@
+package entity
+
+import (
+	"context"
+	"crypto/rsa"
+	"encoding/binary"
+	"fmt"
+	"io"
+	"net"
+	"os"
+
+	aesutil "github.com/lcensies/ssnproj/pkg/aes"
+	"github.com/lcensies/ssnproj/pkg/protocol"
+	rsautil "github.com/lcensies/ssnproj/pkg/rsa"
+	"go.uber.org/zap"
+)
+
+// Error message constants
+const (
+	errSerializeCommand    = "failed to serialize command: %w"
+	errReceiveResponse     = "failed to receive response: %w"
+	errUnexpectedResponse  = "unexpected response type: %v"
+	errDeserializeResponse = "failed to deserialize response: %w"
+)
+
+// Client represents the client connection to the server
+type Client struct {
+	conn         net.Conn
+	logger       *zap.Logger
+	serverPubKey *rsa.PublicKey
+	aesKey       []byte
+}
+
+// NewClient creates a new client
+func NewClient(ctx context.Context, host string, port string, logger *zap.Logger) (*Client, error) {
+	var dialer net.Dialer
+	conn, err := dialer.DialContext(ctx, "tcp", fmt.Sprintf("%s:%s", host, port))
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to server: %w", err)
+	}
+
+	return &Client{
+		conn:   conn,
+		logger: logger,
+	}, nil
+}
+
+// Close closes the client connection
+func (c *Client) Close(ctx context.Context) error {
+	if c.conn != nil {
+		err := c.conn.Close()
+		if err != nil {
+			return fmt.Errorf("failed to close connection: %w", err)
+		}
+	}
+	return nil
+}
+
+// SendMessage sends a protocol message
+func (c *Client) SendMessage(msg *protocol.Message) error {
+	data, err := msg.Serialize()
+	if err != nil {
+		return fmt.Errorf("failed to serialize message: %w", err)
+	}
+
+	_, err = c.conn.Write(data)
+	if err != nil {
+		return fmt.Errorf("failed to send message: %w", err)
+	}
+
+	return nil
+}
+
+// ReceiveMessage receives a protocol message (unencrypted - used for handshake only)
+func (c *Client) ReceiveMessage() (*protocol.Message, error) {
+	// Read header (1 byte type + 4 bytes length)
+	header := make([]byte, 5)
+	_, err := io.ReadFull(c.conn, header)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read message header: %w", err)
+	}
+
+	// Read payload
+	msgType := protocol.MessageType(header[0])
+	payloadLen := binary.BigEndian.Uint32(header[1:5])
+
+	payload := make([]byte, payloadLen)
+	if payloadLen > 0 {
+		_, err = io.ReadFull(c.conn, payload)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read message payload: %w", err)
+		}
+	}
+
+	return &protocol.Message{
+		Type:    msgType,
+		Payload: payload,
+	}, nil
+}
+
+// SendSecureMessage sends an AES-encrypted protocol message
+func (c *Client) SendSecureMessage(msg *protocol.Message) error {
+	// Encrypt the payload with AES
+	encryptedPayload, err := aesutil.Encrypt(msg.Payload, c.aesKey)
+	if err != nil {
+		return fmt.Errorf("failed to encrypt payload: %w", err)
+	}
+
+	// Create message with encrypted payload
+	encryptedMsg := protocol.NewMessage(msg.Type, encryptedPayload)
+	return c.SendMessage(encryptedMsg)
+}
+
+// ReceiveSecureMessage receives and decrypts an AES-encrypted protocol message
+func (c *Client) ReceiveSecureMessage() (*protocol.Message, error) {
+	// Receive encrypted message
+	encryptedMsg, err := c.ReceiveMessage()
+	if err != nil {
+		return nil, err
+	}
+
+	// Decrypt the payload
+	decryptedPayload, err := aesutil.Decrypt(encryptedMsg.Payload, c.aesKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decrypt payload: %w", err)
+	}
+
+	return &protocol.Message{
+		Type:    encryptedMsg.Type,
+		Payload: decryptedPayload,
+	}, nil
+}
+
+// PerformHandshake performs RSA key exchange with the server
+func (c *Client) PerformHandshake(ctx context.Context) error {
+	c.logger.Info("Starting RSA handshake...")
+
+	// Step 1: Receive server's public key
+	c.logger.Info("Waiting for server's public key...")
+	response, err := c.ReceiveMessage()
+	if err != nil {
+		return fmt.Errorf("failed to receive server public key: %w", err)
+	}
+
+	if response.Type != protocol.MessageTypeHandshake {
+		return fmt.Errorf("unexpected message type: %v (expected handshake)", response.Type)
+	}
+
+	// Parse server's public key
+	c.serverPubKey = rsautil.BytesToPublicKey(response.Payload)
+	c.logger.Info("Received server's public key")
+
+	// Step 2: Generate AES key
+	aesKey, err := aesutil.GenerateKey()
+	if err != nil {
+		return fmt.Errorf("failed to generate AES key: %w", err)
+	}
+	c.aesKey = aesKey
+	c.logger.Info("Generated AES session key", zap.Int("key_length", len(c.aesKey)))
+
+	// Step 3: Encrypt AES key with server's public key
+	encryptedAESKey := rsautil.EncryptWithPublicKey(c.aesKey, c.serverPubKey)
+	c.logger.Info("Encrypted AES key with server's public key")
+
+	// Step 4: Send encrypted AES key to server
+	handshakeMsg := protocol.NewMessage(protocol.MessageTypeHandshake, encryptedAESKey)
+	if err := c.SendMessage(handshakeMsg); err != nil {
+		return fmt.Errorf("failed to send encrypted AES key: %w", err)
+	}
+
+	c.logger.Info("Sent encrypted AES key to server - handshake complete")
+
+	return nil
+}
+
+// UploadFile uploads a file to the server
+func (c *Client) UploadFile(ctx context.Context, filename string) error {
+	c.logger.Info("Uploading file", zap.String("filename", filename))
+
+	// Read file
+	fileData, err := os.ReadFile(filename)
+	if err != nil {
+		return fmt.Errorf("failed to read file: %w", err)
+	}
+
+	// Create command message (file data is now included as-is, encryption happens at message level)
+	cmdPayload, err := protocol.SerializeCommand(protocol.CommandUpload, filename, fileData)
+	if err != nil {
+		return fmt.Errorf(errSerializeCommand, err)
+	}
+
+	// Send encrypted command
+	msg := protocol.NewMessage(protocol.MessageTypeCommand, cmdPayload)
+	if err := c.SendSecureMessage(msg); err != nil {
+		return fmt.Errorf("failed to send upload command: %w", err)
+	}
+
+	// Wait for encrypted response
+	response, err := c.ReceiveSecureMessage()
+	if err != nil {
+		return fmt.Errorf(errReceiveResponse, err)
+	}
+
+	if response.Type != protocol.MessageTypeResponse {
+		return fmt.Errorf(errUnexpectedResponse, response.Type)
+	}
+
+	respMsg, err := protocol.DeserializeResponse(response.Payload)
+	if err != nil {
+		return fmt.Errorf(errDeserializeResponse, err)
+	}
+
+	if !respMsg.Success {
+		return fmt.Errorf("upload failed: %s", respMsg.Message)
+	}
+
+	c.logger.Info("File uploaded successfully", zap.String("message", respMsg.Message))
+	return nil
+}
+
+// DownloadFile downloads a file from the server
+func (c *Client) DownloadFile(ctx context.Context, filename string, outputPath string) error {
+	c.logger.Info("Downloading file", zap.String("filename", filename))
+
+	// Create command message
+	cmdPayload, err := protocol.SerializeCommand(protocol.CommandDownload, filename, nil)
+	if err != nil {
+		return fmt.Errorf(errSerializeCommand, err)
+	}
+
+	// Send encrypted command
+	msg := protocol.NewMessage(protocol.MessageTypeCommand, cmdPayload)
+	if err := c.SendSecureMessage(msg); err != nil {
+		return fmt.Errorf("failed to send download command: %w", err)
+	}
+
+	// Wait for encrypted response
+	response, err := c.ReceiveSecureMessage()
+	if err != nil {
+		return fmt.Errorf(errReceiveResponse, err)
+	}
+
+	if response.Type != protocol.MessageTypeResponse {
+		return fmt.Errorf(errUnexpectedResponse, response.Type)
+	}
+
+	respMsg, err := protocol.DeserializeResponse(response.Payload)
+	if err != nil {
+		return fmt.Errorf(errDeserializeResponse, err)
+	}
+
+	if !respMsg.Success {
+		return fmt.Errorf("download failed: %s", respMsg.Message)
+	}
+
+	// Write to file (data is already decrypted at message level)
+	if err := os.WriteFile(outputPath, respMsg.Data, 0644); err != nil {
+		return fmt.Errorf("failed to write file: %w", err)
+	}
+
+	c.logger.Info("File downloaded successfully", zap.String("output", outputPath))
+	return nil
+}
+
+// ListFiles lists files on the server
+func (c *Client) ListFiles(ctx context.Context) (string, error) {
+	c.logger.Info("Listing files")
+
+	// Create command message
+	cmdPayload, err := protocol.SerializeCommand(protocol.CommandList, "", nil)
+	if err != nil {
+		return "", fmt.Errorf(errSerializeCommand, err)
+	}
+
+	// Send encrypted command
+	msg := protocol.NewMessage(protocol.MessageTypeCommand, cmdPayload)
+	if err := c.SendSecureMessage(msg); err != nil {
+		return "", fmt.Errorf("failed to send list command: %w", err)
+	}
+
+	// Wait for encrypted response
+	response, err := c.ReceiveSecureMessage()
+	if err != nil {
+		return "", fmt.Errorf(errReceiveResponse, err)
+	}
+
+	if response.Type != protocol.MessageTypeResponse {
+		return "", fmt.Errorf(errUnexpectedResponse, response.Type)
+	}
+
+	respMsg, err := protocol.DeserializeResponse(response.Payload)
+	if err != nil {
+		return "", fmt.Errorf(errDeserializeResponse, err)
+	}
+
+	if !respMsg.Success {
+		return "", fmt.Errorf("list failed: %s", respMsg.Message)
+	}
+
+	return respMsg.Message, nil
+}
+
+// DeleteFile deletes a file on the server
+func (c *Client) DeleteFile(ctx context.Context, filename string) error {
+	c.logger.Info("Deleting file", zap.String("filename", filename))
+
+	// Create command message
+	cmdPayload, err := protocol.SerializeCommand(protocol.CommandDelete, filename, nil)
+	if err != nil {
+		return fmt.Errorf(errSerializeCommand, err)
+	}
+
+	// Send encrypted command
+	msg := protocol.NewMessage(protocol.MessageTypeCommand, cmdPayload)
+	if err := c.SendSecureMessage(msg); err != nil {
+		return fmt.Errorf("failed to send delete command: %w", err)
+	}
+
+	// Wait for encrypted response
+	response, err := c.ReceiveSecureMessage()
+	if err != nil {
+		return fmt.Errorf(errReceiveResponse, err)
+	}
+
+	if response.Type != protocol.MessageTypeResponse {
+		return fmt.Errorf(errUnexpectedResponse, response.Type)
+	}
+
+	respMsg, err := protocol.DeserializeResponse(response.Payload)
+	if err != nil {
+		return fmt.Errorf(errDeserializeResponse, err)
+	}
+
+	if !respMsg.Success {
+		return fmt.Errorf("delete failed: %s", respMsg.Message)
+	}
+
+	c.logger.Info("File deleted successfully", zap.String("message", respMsg.Message))
+	return nil
+}
