@@ -241,14 +241,18 @@ func DeserializeCommand(data []byte) (*CommandMessage, error) {
 
 	// Read filename
 	filename := make([]byte, filenameLen)
-	if _, err := buf.Read(filename); err != nil {
-		return nil, err
+	if filenameLen > 0 {
+		if _, err := buf.Read(filename); err != nil {
+			return nil, err
+		}
 	}
 
 	// Read remaining data
 	remaining := make([]byte, buf.Len())
-	if _, err := buf.Read(remaining); err != nil && err != io.EOF {
-		return nil, err
+	if len(remaining) > 0 {
+		if _, err := buf.Read(remaining); err != nil && err != io.EOF {
+			return nil, err
+		}
 	}
 
 	return &CommandMessage{

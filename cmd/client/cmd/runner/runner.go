@@ -8,14 +8,14 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/lcensies/ssnproj/cmd/client/internal/entity"
+	clientpkg "github.com/lcensies/ssnproj/pkg/client"
 	"go.uber.org/zap"
 )
 
 // RunClient starts the client and connects to the server
 func RunClient(ctx context.Context, host string, port string, logger *zap.Logger) error {
 	// Create client and connect
-	client, err := entity.NewClient(ctx, host, port, logger)
+	client, err := clientpkg.NewClient(ctx, host, port, logger)
 	if err != nil {
 		return fmt.Errorf("failed to create client: %w", err)
 	}
@@ -34,7 +34,7 @@ func RunClient(ctx context.Context, host string, port string, logger *zap.Logger
 	return runInteractiveCLI(ctx, client, logger)
 }
 
-func runInteractiveCLI(ctx context.Context, client *entity.Client, logger *zap.Logger) error {
+func runInteractiveCLI(ctx context.Context, client *clientpkg.Client, logger *zap.Logger) error {
 	reader := bufio.NewReader(os.Stdin)
 
 	printHelp()
@@ -55,7 +55,7 @@ func runInteractiveCLI(ctx context.Context, client *entity.Client, logger *zap.L
 	}
 }
 
-func processCommand(ctx context.Context, client *entity.Client, logger *zap.Logger, reader *bufio.Reader) error {
+func processCommand(ctx context.Context, client *clientpkg.Client, logger *zap.Logger, reader *bufio.Reader) error {
 	fmt.Print("\n> ")
 	input, err := reader.ReadString('\n')
 	if err != nil {
@@ -91,7 +91,7 @@ func processCommand(ctx context.Context, client *entity.Client, logger *zap.Logg
 	return nil
 }
 
-func handleUpload(ctx context.Context, client *entity.Client, logger *zap.Logger, parts []string) {
+func handleUpload(ctx context.Context, client *clientpkg.Client, logger *zap.Logger, parts []string) {
 	if len(parts) < 2 {
 		fmt.Println("Usage: upload <filename>")
 		return
@@ -105,7 +105,7 @@ func handleUpload(ctx context.Context, client *entity.Client, logger *zap.Logger
 	}
 }
 
-func handleDownload(ctx context.Context, client *entity.Client, logger *zap.Logger, parts []string) {
+func handleDownload(ctx context.Context, client *clientpkg.Client, logger *zap.Logger, parts []string) {
 	if len(parts) < 2 {
 		fmt.Println("Usage: download <filename> [output_path]")
 		return
@@ -127,7 +127,7 @@ func handleDownload(ctx context.Context, client *entity.Client, logger *zap.Logg
 	}
 }
 
-func handleList(ctx context.Context, client *entity.Client, logger *zap.Logger) {
+func handleList(ctx context.Context, client *clientpkg.Client, logger *zap.Logger) {
 	fileList, err := client.ListFiles(ctx)
 	if err != nil {
 		fmt.Printf("Error listing files: %v\n", err)
@@ -143,7 +143,7 @@ func handleList(ctx context.Context, client *entity.Client, logger *zap.Logger) 
 	}
 }
 
-func handleDelete(ctx context.Context, client *entity.Client, logger *zap.Logger, parts []string, reader *bufio.Reader) {
+func handleDelete(ctx context.Context, client *clientpkg.Client, logger *zap.Logger, parts []string, reader *bufio.Reader) {
 	if len(parts) < 2 {
 		fmt.Println("Usage: delete <filename>")
 		return

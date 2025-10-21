@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"path/filepath"
 	"time"
 
 	aesutil "github.com/lcensies/ssnproj/pkg/aes"
@@ -53,6 +54,30 @@ func NewClient(ctx context.Context, host string, port string, logger *zap.Logger
 	return &Client{
 		conn:   conn,
 		logger: logger,
+	}, nil
+}
+
+// NewClientWithServerPubKey creates a new client with server's public key loaded from file
+func NewClientWithServerPubKey(ctx context.Context, host string, port string, serverPubKeyPath string, logger *zap.Logger) (*Client, error) {
+	var dialer net.Dialer
+	conn, err := dialer.DialContext(ctx, "tcp", fmt.Sprintf("%s:%s", host, port))
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to server: %w", err)
+	}
+
+	// Load server's public key from file
+	serverPubKeyBytes, err := os.ReadFile(serverPubKeyPath)
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("failed to read server public key: %w", err)
+	}
+
+	serverPubKey := rsautil.BytesToPublicKey(serverPubKeyBytes)
+
+	return &Client{
+		conn:         conn,
+		logger:       logger,
+		serverPubKey: serverPubKey,
 	}, nil
 }
 
@@ -151,20 +176,24 @@ func (c *Client) ReceiveSecureMessage() (*protocol.Message, error) {
 func (c *Client) PerformHandshake(ctx context.Context) error {
 	c.logger.Info("Starting RSA handshake...")
 
-	// Step 1: Receive server's public key
-	c.logger.Info("Waiting for server's public key...")
-	response, err := c.ReceiveMessage()
-	if err != nil {
-		return fmt.Errorf("failed to receive server public key: %w", err)
-	}
+	// Step 1: Receive server's public key (only if not already loaded)
+	if c.serverPubKey == nil {
+		c.logger.Info("Waiting for server's public key...")
+		response, err := c.ReceiveMessage()
+		if err != nil {
+			return fmt.Errorf("failed to receive server public key: %w", err)
+		}
 
-	if response.Type != protocol.MessageTypeHandshake {
-		return fmt.Errorf("unexpected message type: %v (expected handshake)", response.Type)
-	}
+		if response.Type != protocol.MessageTypeHandshake {
+			return fmt.Errorf("unexpected message type: %v (expected handshake)", response.Type)
+		}
 
-	// Parse server's public key
-	c.serverPubKey = rsautil.BytesToPublicKey(response.Payload)
-	c.logger.Info("Received server's public key")
+		// Parse server's public key
+		c.serverPubKey = rsautil.BytesToPublicKey(response.Payload)
+		c.logger.Info("Received server's public key")
+	} else {
+		c.logger.Info("Using pre-loaded server's public key")
+	}
 
 	// Step 2: Generate AES key
 	aesKey, err := aesutil.GenerateKey()
@@ -184,7 +213,19 @@ func (c *Client) PerformHandshake(ctx context.Context) error {
 		return fmt.Errorf("failed to send encrypted AES key: %w", err)
 	}
 
-	c.logger.Info("Sent encrypted AES key to server - handshake complete")
+	c.logger.Info("Sent encrypted AES key to server")
+
+	// Step 5: Wait for server's handshake confirmation
+	response, err := c.ReceiveMessage()
+	if err != nil {
+		return fmt.Errorf("failed to receive handshake confirmation: %w", err)
+	}
+
+	if response.Type != protocol.MessageTypeResponse {
+		return fmt.Errorf("unexpected message type: %v (expected response)", response.Type)
+	}
+
+	c.logger.Info("Received handshake confirmation - handshake complete")
 
 	return nil
 }
@@ -200,7 +241,8 @@ func (c *Client) UploadFile(ctx context.Context, filename string) error {
 	}
 
 	// Create command message (file data is now included as-is, encryption happens at message level)
-	cmdPayload, err := protocol.SerializeCommand(protocol.CommandUpload, filename, fileData)
+	// Send just the basename of the file, not the full path
+	cmdPayload, err := protocol.SerializeCommand(protocol.CommandUpload, filepath.Base(filename), fileData)
 	if err != nil {
 		return fmt.Errorf(errSerializeCommand, err)
 	}

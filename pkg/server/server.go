@@ -14,10 +14,10 @@ import (
 )
 
 type ServerConfig struct {
-	host         string
-	port         string
-	configFolder string
-	rootDir      *string
+	Host         string
+	Port         string
+	ConfigFolder string
+	RootDir      *string
 }
 
 const defaultRootDir = "data"
@@ -89,17 +89,21 @@ func NewConnectionHandler(
 func (handler *ConnectionHandler) handleHandshake(m *protocol.Message) error {
 	handler.state = ConnectionStateHandshake
 
-	aesKey, err := aesUtil.GenerateKey()
-	if err != nil {
-		return err
-	}
+	// Decrypt the AES key sent by the client
+	aesKey := rsaUtil.DecryptWithPrivateKey(m.Payload, handler.rsaKeyPair.Private)
 	handler.aesKey = aesKey
-	encryptedAesKey := rsaUtil.EncryptWithPublicKey(aesKey, handler.rsaKeyPair.Public)
-	response, err := protocol.NewMessage(protocol.MessageTypeHandshake, encryptedAesKey).Serialize()
+
+	// Send confirmation response
+	response, err := protocol.NewMessage(protocol.MessageTypeResponse, []byte("handshake complete")).Serialize()
 	if err != nil {
-		return fmt.Errorf("error serializing response: %v", err)
+		return fmt.Errorf("error serializing handshake response: %v", err)
 	}
-	handler.conn.Write(response)
+	_, err = handler.conn.Write(response)
+	if err != nil {
+		return fmt.Errorf("error sending handshake response: %v", err)
+	}
+
+	handler.state = ConnectionStateAuthenticated
 	return nil
 }
 
@@ -113,10 +117,15 @@ func (handler *ConnectionHandler) handleCommand(message *protocol.Message) error
 }
 
 func (handler *ConnectionHandler) handleMessage(message *protocol.Message) error {
-
 	if message.Type == protocol.MessageTypeHandshake {
 		return handler.handleHandshake(message)
 	}
+
+	// Only decrypt if we have an AES key (after handshake)
+	if handler.aesKey == nil {
+		return fmt.Errorf("received non-handshake message before handshake complete")
+	}
+
 	err := message.Decrypt(handler.aesKey)
 	if err != nil {
 		return err
@@ -126,11 +135,11 @@ func (handler *ConnectionHandler) handleMessage(message *protocol.Message) error
 	case protocol.MessageTypeCommand:
 		return handler.handleCommand(message)
 	default:
-		return fmt.Errorf("Unexpected message type: %v", message.Type)
+		return fmt.Errorf("unexpected message type: %v", message.Type)
 	}
 }
 
-func (handler *ConnectionHandler) handleRawRequest() {
+func (handler *ConnectionHandler) HandleRawRequest() {
 	reader := bufio.NewReader(handler.conn)
 	buffer := make([]byte, 1024)
 
@@ -181,7 +190,7 @@ func NewServer(config *ServerConfig) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	rsaKeyPair, err := rsaUtil.LoadKeypair(config.configFolder)
+	rsaKeyPair, err := rsaUtil.LoadKeypair(config.ConfigFolder)
 	if err != nil {
 		return nil, err
 	}
@@ -192,8 +201,13 @@ func NewServer(config *ServerConfig) (*Server, error) {
 	}, nil
 }
 
+// SetRSAKeyPair sets the RSA key pair for testing purposes
+func (server *Server) SetRSAKeyPair(keyPair *rsaUtil.RSAKeyPair) {
+	server.rsaKeyPair = keyPair
+}
+
 func (server *Server) Run() {
-	listener, err := net.Listen("tcp", fmt.Sprintf("%s:%s", server.config.host, server.config.port))
+	listener, err := net.Listen("tcp", fmt.Sprintf("%s:%s", server.config.Host, server.config.Port))
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -205,7 +219,7 @@ func (server *Server) Run() {
 			log.Fatal(err)
 		}
 
-		client := NewConnectionHandler(conn, server.rsaKeyPair, server.logger, server.config.rootDir)
-		go client.handleRawRequest()
+		client := NewConnectionHandler(conn, server.rsaKeyPair, server.logger, server.config.RootDir)
+		go client.HandleRawRequest()
 	}
 }
