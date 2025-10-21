@@ -1,5 +1,7 @@
 data/
 client
+bin
+configs
 
 
 # Byte-compiled / optimized / DLL files

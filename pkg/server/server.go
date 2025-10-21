@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"os"
 
 	aesUtil "github.com/lcensies/ssnproj/pkg/aes"
 	protocol "github.com/lcensies/ssnproj/pkg/protocol"
@@ -190,10 +191,25 @@ func NewServer(config *ServerConfig) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// Create root directory if it doesn't exist
+	if config.RootDir != nil {
+		if err := os.MkdirAll(*config.RootDir, 0755); err != nil {
+			return nil, fmt.Errorf("failed to create root directory: %w", err)
+		}
+	}
+
+	// Load or generate RSA key pair
 	rsaKeyPair, err := rsaUtil.LoadKeypair(config.ConfigFolder)
 	if err != nil {
 		return nil, err
 	}
+
+	logger.Info("Server initialized successfully",
+		zap.String("config_folder", config.ConfigFolder),
+		zap.String("root_dir", *config.RootDir),
+	)
+
 	return &Server{
 		config:     config,
 		rsaKeyPair: rsaKeyPair,

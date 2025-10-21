@@ -119,21 +119,53 @@ func DecryptWithPrivateKey(ciphertext []byte, priv *rsa.PrivateKey) []byte {
 }
 
 func LoadKeypair(configFolder string) (*RSAKeyPair, error) {
+	// Check if config folder exists
 	if _, err := os.Stat(configFolder); os.IsNotExist(err) {
+		// Create directory
+		if err := os.MkdirAll(configFolder, 0755); err != nil {
+			return nil, fmt.Errorf("failed to create config directory: %w", err)
+		}
+	}
+
+	// Check if key files exist
+	privKeyPath := fmt.Sprintf("%s/private.pem", configFolder)
+	pubKeyPath := fmt.Sprintf("%s/public.pem", configFolder)
+
+	_, privExists := os.Stat(privKeyPath)
+	_, pubExists := os.Stat(pubKeyPath)
+
+	// If either key file doesn't exist, generate new keys
+	if os.IsNotExist(privExists) || os.IsNotExist(pubExists) {
 		privKey, pubKey := GenerateKeyPair(defaultRsaKeySize)
+
+		// Save private key
+		privKeyBytes := PrivateKeyToBytes(privKey)
+		if err := os.WriteFile(privKeyPath, privKeyBytes, 0600); err != nil {
+			return nil, fmt.Errorf("failed to save private key: %w", err)
+		}
+
+		// Save public key
+		pubKeyBytes := PublicKeyToBytes(pubKey)
+		if err := os.WriteFile(pubKeyPath, pubKeyBytes, 0644); err != nil {
+			return nil, fmt.Errorf("failed to save public key: %w", err)
+		}
+
 		return &RSAKeyPair{
 			Private: privKey,
 			Public:  pubKey,
 		}, nil
 	}
-	privKeyBytes, err := os.ReadFile(fmt.Sprintf("%s/private.pem", configFolder))
+
+	// Load existing keys
+	privKeyBytes, err := os.ReadFile(privKeyPath)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to read private key: %w", err)
 	}
-	pubKeyBytes, err := os.ReadFile(fmt.Sprintf("%s/public.pem", configFolder))
+	pubKeyBytes, err := os.ReadFile(pubKeyPath)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to read public key: %w", err)
 	}
+
 	privKey := BytesToPrivateKey(privKeyBytes)
 	pubKey := BytesToPublicKey(pubKeyBytes)
 	return &RSAKeyPair{
