@@ -123,6 +123,8 @@ The file data is encrypted using AES-256-GCM with the shared session key.
 - Filename: UTF-8 string
 - Data: (empty)
 
+**Response:** Server sends initial response followed by chunked data transfer using `MessageTypeData` messages.
+
 #### List Command (0x03)
 
 **Payload:**
@@ -162,7 +164,7 @@ Server responses use `MessageTypeResponse` with this payload:
 ### Response Data
 
 - **Upload**: Data field is empty
-- **Download**: Data field contains **AES-256-GCM encrypted file contents**
+- **Download**: Initial response indicates chunked transfer will begin, followed by chunked data messages
 - **List**: Data field is empty (file list is in Message field)
 - **Delete**: Data field is empty
 
@@ -193,6 +195,85 @@ Server responses use `MessageTypeResponse` with this payload:
 ```
 
 The nonce is prepended to the ciphertext and used for decryption.
+
+## Chunked Data Transfer
+
+For large file downloads, the system automatically uses chunked transfer to improve performance and provide progress tracking.
+
+### Chunk Data Message Structure
+
+Chunked data is sent using `MessageTypeData` with this payload structure:
+
+```
++-------------+----------------+-------------+-------------+-------------+-------------+-----------+
+| Filename    | Chunk Index    | Total Chunks| Chunk Size  | Total Size  | Data        |
+| Len (2)     | (4 bytes)      | (4 bytes)   | (4 bytes)   | (8 bytes)   | (N bytes)   |
++-------------+----------------+-------------+-------------+-------------+-------------+-----------+
+```
+
+### Fields
+
+1. **Filename Length** (2 bytes, big-endian): Length of filename
+2. **Filename** (N bytes): UTF-8 filename string
+3. **Chunk Index** (4 bytes, big-endian): Current chunk number (0-based)
+4. **Total Chunks** (4 bytes, big-endian): Total number of chunks for this file
+5. **Chunk Size** (4 bytes, big-endian): Size of current chunk in bytes
+6. **Total Size** (8 bytes, big-endian): Total file size in bytes
+7. **Data** (N bytes): Chunk data (AES-256-GCM encrypted)
+
+### Chunked Download Flow
+
+```
+1. Client → Server: MessageTypeCommand (Download)
+   - Command: 0x02 (Download)
+   - Filename: "large_file.bin"
+
+2. Server → Client: MessageTypeResponse
+   - Success: 0x01
+   - Message: "Starting chunked download"
+   - Data: (empty)
+
+3. Server → Client: MessageTypeData (Chunk 0)
+   - Filename: "large_file.bin"
+   - Chunk Index: 0
+   - Total Chunks: 10
+   - Chunk Size: 65536
+   - Total Size: 655360
+   - Data: <encrypted chunk 0>
+
+4. Server → Client: MessageTypeData (Chunk 1)
+   - Filename: "large_file.bin"
+   - Chunk Index: 1
+   - Total Chunks: 10
+   - Chunk Size: 65536
+   - Total Size: 655360
+   - Data: <encrypted chunk 1>
+
+... (continues for all chunks)
+
+N. Server → Client: MessageTypeData (Final Chunk)
+   - Filename: "large_file.bin"
+   - Chunk Index: 9
+   - Total Chunks: 10
+   - Chunk Size: 65536
+   - Total Size: 655360
+   - Data: <encrypted final chunk>
+```
+
+### Chunk Configuration
+
+- **Default Chunk Size**: 64 KB (65,536 bytes)
+- **Progress Tracking**: Each chunk includes progress information
+- **Automatic Detection**: System automatically uses chunked transfer for all downloads
+- **Integrity Verification**: Client verifies total file size and chunk count
+
+### Benefits
+
+1. **Memory Efficiency**: Large files don't need to be loaded entirely into memory
+2. **Progress Tracking**: Client can display download progress
+3. **Error Recovery**: Individual chunks can be retried if needed
+4. **Network Optimization**: Smaller packets reduce network congestion
+5. **Real-time Processing**: Client can start processing data as chunks arrive
 
 ## Security Considerations
 
@@ -248,6 +329,44 @@ The nonce is prepended to the ciphertext and used for decryption.
    - Data: (empty)
 ```
 
+### Successful Chunked Download
+
+```
+1. Client → Server: MessageTypeCommand
+   - Command: 0x02 (Download)
+   - Filename: "large_file.bin"
+   - Data: (empty)
+
+2. Server → Client: MessageTypeResponse
+   - Success: 0x01
+   - Message: "Starting chunked download"
+   - Data: (empty)
+
+3. Server → Client: MessageTypeData
+   - Filename: "large_file.bin"
+   - Chunk Index: 0
+   - Total Chunks: 3
+   - Chunk Size: 65536
+   - Total Size: 196608
+   - Data: <AES-encrypted chunk 0>
+
+4. Server → Client: MessageTypeData
+   - Filename: "large_file.bin"
+   - Chunk Index: 1
+   - Total Chunks: 3
+   - Chunk Size: 65536
+   - Total Size: 196608
+   - Data: <AES-encrypted chunk 1>
+
+5. Server → Client: MessageTypeData
+   - Filename: "large_file.bin"
+   - Chunk Index: 2
+   - Total Chunks: 3
+   - Chunk Size: 65536
+   - Total Size: 196608
+   - Data: <AES-encrypted chunk 2>
+```
+
 ### Failed Download
 
 ```
@@ -296,15 +415,18 @@ The nonce is prepended to the ciphertext and used for decryption.
 - RSA operations (key exchange only): ~1-10ms
 - AES encryption: ~100-500 MB/s (depending on hardware)
 - TCP overhead: Minimal for file transfer
-- Recommended max file size: Limited by available memory (loads entire file)
+- Chunked transfer: 64KB chunks provide optimal balance of memory usage and network efficiency
+- Memory usage: Constant regardless of file size (chunked transfer)
+- Progress tracking: Real-time progress updates for large file transfers
 
 ## Future Enhancements
 
-1. **Chunked Transfer:** Support streaming large files in chunks
-2. **Compression:** Add optional GZIP compression before encryption
-3. **Resume Support:** Allow interrupted transfers to resume
-4. **Multiple Files:** Batch upload/download operations
-5. **Authentication:** Add user authentication system
-6. **TLS Integration:** Consider using TLS instead of custom crypto
-7. **DHE Key Exchange:** Implement Diffie-Hellman for forward secrecy
+1. **Compression:** Add optional GZIP compression before encryption
+2. **Resume Support:** Allow interrupted transfers to resume from last chunk
+3. **Multiple Files:** Batch upload/download operations
+4. **Authentication:** Add user authentication system
+5. **TLS Integration:** Consider using TLS instead of custom crypto
+6. **DHE Key Exchange:** Implement Diffie-Hellman for forward secrecy
+7. **Adaptive Chunk Size:** Dynamically adjust chunk size based on network conditions
+8. **Parallel Chunks:** Support downloading multiple chunks in parallel
 

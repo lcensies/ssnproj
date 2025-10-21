@@ -276,7 +276,7 @@ func (c *Client) UploadFile(ctx context.Context, filename string) error {
 	return nil
 }
 
-// DownloadFile downloads a file from the server
+// DownloadFile downloads a file from the server using chunked transfer
 func (c *Client) DownloadFile(ctx context.Context, filename string, outputPath string) error {
 	c.logger.Info("Downloading file", zap.String("filename", filename))
 
@@ -292,7 +292,7 @@ func (c *Client) DownloadFile(ctx context.Context, filename string, outputPath s
 		return fmt.Errorf("failed to send download command: %w", err)
 	}
 
-	// Wait for encrypted response
+	// Wait for initial response
 	response, err := c.ReceiveSecureMessage()
 	if err != nil {
 		return fmt.Errorf(errReceiveResponse, err)
@@ -311,12 +311,109 @@ func (c *Client) DownloadFile(ctx context.Context, filename string, outputPath s
 		return fmt.Errorf("download failed: %s", respMsg.Message)
 	}
 
-	// Write to file (data is already decrypted at message level)
-	if err := os.WriteFile(outputPath, respMsg.Data, 0644); err != nil {
-		return fmt.Errorf("failed to write file: %w", err)
+	c.logger.Info("Starting chunked download", zap.String("message", respMsg.Message))
+
+	// Receive chunks and reconstruct file
+	return c.receiveFileChunks(ctx, filename, outputPath)
+}
+
+// receiveFileChunks receives file chunks and reconstructs the complete file
+func (c *Client) receiveFileChunks(ctx context.Context, filename string, outputPath string) error {
+	var chunks []protocol.ChunkDataMessage
+	var totalSize uint64
+	var totalChunks uint32
+
+	// Create output file
+	file, err := os.Create(outputPath)
+	if err != nil {
+		return fmt.Errorf("failed to create output file: %w", err)
+	}
+	defer file.Close()
+
+	// Receive all chunks
+	for {
+		// Wait for chunk data message
+		chunkMsg, err := c.ReceiveSecureMessage()
+		if err != nil {
+			return fmt.Errorf("failed to receive chunk: %w", err)
+		}
+
+		// Check if this is the end of transfer (no more chunks)
+		if chunkMsg.Type != protocol.MessageTypeData {
+			// If we receive a response message, it might be an error or completion
+			if chunkMsg.Type == protocol.MessageTypeResponse {
+				respMsg, err := protocol.DeserializeResponse(chunkMsg.Payload)
+				if err == nil && respMsg.Success {
+					c.logger.Info("Download completed", zap.String("message", respMsg.Message))
+					break
+				}
+			}
+			return fmt.Errorf("unexpected message type during chunked download: %v", chunkMsg.Type)
+		}
+
+		// Deserialize chunk data
+		chunk, err := protocol.DeserializeChunkData(chunkMsg.Payload)
+		if err != nil {
+			return fmt.Errorf("failed to deserialize chunk: %w", err)
+		}
+
+		// Validate chunk belongs to this file
+		if chunk.Filename != filename {
+			return fmt.Errorf("chunk filename mismatch: expected %s, got %s", filename, chunk.Filename)
+		}
+
+		// Store metadata from first chunk
+		if len(chunks) == 0 {
+			totalSize = chunk.TotalSize
+			totalChunks = chunk.TotalChunks
+			c.logger.Info("Receiving file chunks",
+				zap.String("filename", filename),
+				zap.Uint64("totalSize", totalSize),
+				zap.Uint32("totalChunks", totalChunks))
+		}
+
+		// Write chunk data to file
+		if _, err := file.Write(chunk.Data); err != nil {
+			return fmt.Errorf("failed to write chunk %d to file: %w", chunk.ChunkIndex, err)
+		}
+
+		chunks = append(chunks, *chunk)
+
+		// Log progress
+		progress := float64(len(chunks)) / float64(totalChunks) * 100
+		c.logger.Debug("Received chunk",
+			zap.String("filename", filename),
+			zap.Uint32("chunkIndex", chunk.ChunkIndex),
+			zap.Uint32("chunkSize", chunk.ChunkSize),
+			zap.Float64("progress", progress))
+
+		// Check if we've received all chunks
+		if len(chunks) >= int(totalChunks) {
+			c.logger.Info("All chunks received", zap.String("filename", filename))
+			break
+		}
 	}
 
-	c.logger.Info("File downloaded successfully", zap.String("output", outputPath))
+	// Verify we received all chunks
+	if len(chunks) != int(totalChunks) {
+		return fmt.Errorf("incomplete download: received %d chunks, expected %d", len(chunks), totalChunks)
+	}
+
+	// Verify file size
+	fileInfo, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf("failed to get file info: %w", err)
+	}
+
+	if uint64(fileInfo.Size()) != totalSize {
+		return fmt.Errorf("file size mismatch: expected %d bytes, got %d", totalSize, fileInfo.Size())
+	}
+
+	c.logger.Info("File downloaded successfully",
+		zap.String("output", outputPath),
+		zap.Uint64("size", totalSize),
+		zap.Uint32("chunks", totalChunks))
+
 	return nil
 }
 

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -277,6 +278,168 @@ func TestHandleDownload_FileNotFound(t *testing.T) {
 
 	if respMsg.Success {
 		t.Errorf("Expected success=false for nonexistent file, got %v", respMsg.Success)
+	}
+}
+
+func TestHandleDownload_ChunkedTransfer(t *testing.T) {
+	// Setup
+	tempDir := createTestTempDir(t)
+	defer cleanupTestTempDir(t, tempDir)
+
+	logger := createTestLogger(t)
+	defer logger.Sync()
+
+	// Create a large test file (larger than chunk size)
+	filename := "large_test_file.txt"
+	fileContent := make([]byte, 200*1024) // 200KB file
+	for i := range fileContent {
+		fileContent[i] = byte(i % 256)
+	}
+	filePath := filepath.Join(tempDir, filename)
+	if err := os.WriteFile(filePath, fileContent, 0644); err != nil {
+		t.Fatalf("Failed to create test file: %v", err)
+	}
+
+	// Create mock connection handler
+	mockConn := &MockConnectionHandler{}
+	cmdHandler := NewCommandHandler(mockConn, logger, &tempDir)
+
+	command := &protocol.CommandMessage{
+		Command:  protocol.CommandDownload,
+		Filename: filename,
+		Data:     nil,
+	}
+
+	err := cmdHandler.handleDownload(command)
+	if err != nil {
+		t.Fatalf("handleDownload failed: %v", err)
+	}
+
+	// Verify initial response was sent
+	if len(mockConn.sentMessages) < 1 {
+		t.Fatalf("Expected at least 1 sent message, got %d", len(mockConn.sentMessages))
+	}
+
+	// Check initial response
+	initialResponse := mockConn.sentMessages[0]
+	if initialResponse.Type != protocol.MessageTypeResponse {
+		t.Errorf("Expected initial response type %v, got %v", protocol.MessageTypeResponse, initialResponse.Type)
+	}
+
+	respMsg, err := protocol.DeserializeResponse(initialResponse.Payload)
+	if err != nil {
+		t.Fatalf("Failed to deserialize initial response: %v", err)
+	}
+
+	if !respMsg.Success {
+		t.Errorf("Expected initial success=true, got %v. Message: %s", respMsg.Success, respMsg.Message)
+	}
+
+	// Verify chunks were sent
+	chunkCount := 0
+	for i := 1; i < len(mockConn.sentMessages); i++ {
+		msg := mockConn.sentMessages[i]
+		if msg.Type == protocol.MessageTypeData {
+			chunkCount++
+			
+			// Deserialize chunk data
+			chunk, err := protocol.DeserializeChunkData(msg.Payload)
+			if err != nil {
+				t.Fatalf("Failed to deserialize chunk %d: %v", chunkCount, err)
+			}
+
+			// Verify chunk metadata
+			if chunk.Filename != filename {
+				t.Errorf("Chunk %d filename mismatch: expected %s, got %s", chunkCount, filename, chunk.Filename)
+			}
+
+			if chunk.ChunkIndex != uint32(chunkCount-1) {
+				t.Errorf("Chunk %d index mismatch: expected %d, got %d", chunkCount, chunkCount-1, chunk.ChunkIndex)
+			}
+
+			// Verify chunk data integrity
+			expectedStart := chunk.ChunkIndex * 64 * 1024 // 64KB chunks
+			expectedEnd := expectedStart + uint32(len(chunk.Data))
+			if expectedEnd > uint32(len(fileContent)) {
+				expectedEnd = uint32(len(fileContent))
+			}
+			expectedData := fileContent[expectedStart:expectedEnd]
+
+			if !bytes.Equal(chunk.Data, expectedData) {
+				t.Errorf("Chunk %d data mismatch", chunkCount)
+			}
+		}
+	}
+
+	// Verify we got multiple chunks for a large file
+	if chunkCount < 2 {
+		t.Errorf("Expected multiple chunks for large file, got %d", chunkCount)
+	}
+
+	// Verify total chunks calculation
+	expectedChunks := uint32((len(fileContent) + 64*1024 - 1) / (64 * 1024))
+	if chunkCount != int(expectedChunks) {
+		t.Errorf("Expected %d chunks, got %d", expectedChunks, chunkCount)
+	}
+}
+
+func TestSendFileInChunks_SmallFile(t *testing.T) {
+	// Setup
+	tempDir := createTestTempDir(t)
+	defer cleanupTestTempDir(t, tempDir)
+
+	logger := createTestLogger(t)
+	defer logger.Sync()
+
+	// Create a small test file (smaller than chunk size)
+	filename := "small_test_file.txt"
+	fileContent := []byte("This is a small file")
+	
+	// Create mock connection handler
+	mockConn := &MockConnectionHandler{}
+	cmdHandler := NewCommandHandler(mockConn, logger, &tempDir)
+
+	// Test sendFileInChunks directly
+	err := cmdHandler.sendFileInChunks(filename, fileContent)
+	if err != nil {
+		t.Fatalf("sendFileInChunks failed: %v", err)
+	}
+
+	// Verify exactly one chunk was sent
+	if len(mockConn.sentMessages) != 1 {
+		t.Fatalf("Expected 1 chunk for small file, got %d", len(mockConn.sentMessages))
+	}
+
+	// Verify chunk data
+	chunkMsg := mockConn.sentMessages[0]
+	if chunkMsg.Type != protocol.MessageTypeData {
+		t.Errorf("Expected chunk message type %v, got %v", protocol.MessageTypeData, chunkMsg.Type)
+	}
+
+	chunk, err := protocol.DeserializeChunkData(chunkMsg.Payload)
+	if err != nil {
+		t.Fatalf("Failed to deserialize chunk: %v", err)
+	}
+
+	// Verify chunk metadata
+	if chunk.Filename != filename {
+		t.Errorf("Chunk filename mismatch: expected %s, got %s", filename, chunk.Filename)
+	}
+
+	if chunk.ChunkIndex != 0 {
+		t.Errorf("Expected chunk index 0, got %d", chunk.ChunkIndex)
+	}
+
+	if chunk.TotalChunks != 1 {
+		t.Errorf("Expected total chunks 1, got %d", chunk.TotalChunks)
+	}
+
+	if chunk.TotalSize != uint64(len(fileContent)) {
+		t.Errorf("Expected total size %d, got %d", len(fileContent), chunk.TotalSize)
+	}
+
+	if !bytes.Equal(chunk.Data, fileContent) {
+		t.Errorf("Chunk data mismatch")
 	}
 }
 

@@ -83,13 +83,75 @@ func (handler *CommandHandler) handleDownload(command *protocol.CommandMessage) 
 		return nil // Don't return the error, we've sent a response
 	}
 
-	responsePayload, err := protocol.SerializeResponse(true, "File downloaded successfully", fileData)
+	// Send initial response indicating chunked transfer will begin
+	responsePayload, err := protocol.SerializeResponse(true, "Starting chunked download", nil)
 	if err != nil {
 		return err
 	}
 
 	response := protocol.NewMessage(protocol.MessageTypeResponse, responsePayload)
-	return handler.conn.SendSecureMessage(response)
+	if err := handler.conn.SendSecureMessage(response); err != nil {
+		return err
+	}
+
+	// Send file in chunks
+	return handler.sendFileInChunks(command.Filename, fileData)
+}
+
+// sendFileInChunks sends a file in chunks with progress information
+func (handler *CommandHandler) sendFileInChunks(filename string, fileData []byte) error {
+	const chunkSize = 64 * 1024 // 64KB chunks
+	totalSize := uint64(len(fileData))
+	totalChunks := uint32((totalSize + chunkSize - 1) / chunkSize) // Round up division
+
+	handler.logger.Info("Sending file in chunks",
+		zap.String("filename", filename),
+		zap.Uint64("totalSize", totalSize),
+		zap.Uint32("totalChunks", totalChunks),
+		zap.Uint32("chunkSize", chunkSize))
+
+	for i := uint32(0); i < totalChunks; i++ {
+		start := i * chunkSize
+		end := start + chunkSize
+		if end > uint32(totalSize) {
+			end = uint32(totalSize)
+		}
+
+		chunkData := fileData[start:end]
+		actualChunkSize := uint32(len(chunkData))
+
+		// Create chunk message
+		chunk := &protocol.ChunkDataMessage{
+			Filename:    filename,
+			ChunkIndex:  i,
+			TotalChunks: totalChunks,
+			ChunkSize:   actualChunkSize,
+			TotalSize:   totalSize,
+			Data:        chunkData,
+		}
+
+		// Serialize chunk
+		chunkPayload, err := protocol.SerializeChunkData(chunk)
+		if err != nil {
+			return fmt.Errorf("failed to serialize chunk %d: %w", i, err)
+		}
+
+		// Send chunk as data message
+		chunkMsg := protocol.NewMessage(protocol.MessageTypeData, chunkPayload)
+		if err := handler.conn.SendSecureMessage(chunkMsg); err != nil {
+			return fmt.Errorf("failed to send chunk %d: %w", i, err)
+		}
+
+		// Log progress
+		progress := float64(i+1) / float64(totalChunks) * 100
+		handler.logger.Debug("Sent chunk",
+			zap.String("filename", filename),
+			zap.Uint32("chunkIndex", i),
+			zap.Float64("progress", progress))
+	}
+
+	handler.logger.Info("File transfer completed", zap.String("filename", filename))
+	return nil
 }
 
 func (handler *CommandHandler) getClientDir() (string, error) {

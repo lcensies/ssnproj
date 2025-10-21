@@ -57,6 +57,16 @@ type ResponseMessage struct {
 	Data    []byte
 }
 
+// ChunkDataMessage represents a chunk of file data with progress information
+type ChunkDataMessage struct {
+	Filename    string
+	ChunkIndex  uint32
+	TotalChunks uint32
+	ChunkSize   uint32
+	TotalSize   uint64
+	Data        []byte
+}
+
 // NewMessage creates a new message
 func NewMessage(msgType MessageType, payload []byte) *Message {
 	return &Message{
@@ -333,5 +343,110 @@ func DeserializeResponse(data []byte) (*ResponseMessage, error) {
 		Success: success,
 		Message: string(message),
 		Data:    remaining,
+	}, nil
+}
+
+// SerializeChunkData serializes a chunk data message
+func SerializeChunkData(chunk *ChunkDataMessage) ([]byte, error) {
+	buf := new(bytes.Buffer)
+
+	// Write filename length (2 bytes)
+	filenameLen := uint16(len(chunk.Filename))
+	if err := binary.Write(buf, binary.BigEndian, filenameLen); err != nil {
+		return nil, err
+	}
+
+	// Write filename
+	if _, err := buf.WriteString(chunk.Filename); err != nil {
+		return nil, err
+	}
+
+	// Write chunk index (4 bytes)
+	if err := binary.Write(buf, binary.BigEndian, chunk.ChunkIndex); err != nil {
+		return nil, err
+	}
+
+	// Write total chunks (4 bytes)
+	if err := binary.Write(buf, binary.BigEndian, chunk.TotalChunks); err != nil {
+		return nil, err
+	}
+
+	// Write chunk size (4 bytes)
+	if err := binary.Write(buf, binary.BigEndian, chunk.ChunkSize); err != nil {
+		return nil, err
+	}
+
+	// Write total size (8 bytes)
+	if err := binary.Write(buf, binary.BigEndian, chunk.TotalSize); err != nil {
+		return nil, err
+	}
+
+	// Write data
+	if _, err := buf.Write(chunk.Data); err != nil {
+		return nil, err
+	}
+
+	return buf.Bytes(), nil
+}
+
+// DeserializeChunkData deserializes a chunk data message
+func DeserializeChunkData(data []byte) (*ChunkDataMessage, error) {
+	if len(data) < 22 { // minimum size: 2 + 4 + 4 + 4 + 8 = 22 bytes
+		return nil, errors.New("chunk data too short")
+	}
+
+	buf := bytes.NewReader(data)
+
+	// Read filename length
+	var filenameLen uint16
+	if err := binary.Read(buf, binary.BigEndian, &filenameLen); err != nil {
+		return nil, err
+	}
+
+	// Read filename
+	filename := make([]byte, filenameLen)
+	if filenameLen > 0 {
+		if _, err := buf.Read(filename); err != nil {
+			return nil, err
+		}
+	}
+
+	// Read chunk index
+	var chunkIndex uint32
+	if err := binary.Read(buf, binary.BigEndian, &chunkIndex); err != nil {
+		return nil, err
+	}
+
+	// Read total chunks
+	var totalChunks uint32
+	if err := binary.Read(buf, binary.BigEndian, &totalChunks); err != nil {
+		return nil, err
+	}
+
+	// Read chunk size
+	var chunkSize uint32
+	if err := binary.Read(buf, binary.BigEndian, &chunkSize); err != nil {
+		return nil, err
+	}
+
+	// Read total size
+	var totalSize uint64
+	if err := binary.Read(buf, binary.BigEndian, &totalSize); err != nil {
+		return nil, err
+	}
+
+	// Read remaining data
+	remaining := make([]byte, buf.Len())
+	if _, err := buf.Read(remaining); err != nil && err != io.EOF {
+		return nil, err
+	}
+
+	return &ChunkDataMessage{
+		Filename:    string(filename),
+		ChunkIndex:  chunkIndex,
+		TotalChunks: totalChunks,
+		ChunkSize:   chunkSize,
+		TotalSize:   totalSize,
+		Data:        remaining,
 	}, nil
 }

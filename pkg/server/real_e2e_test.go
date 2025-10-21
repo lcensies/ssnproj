@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net"
@@ -261,6 +262,118 @@ func TestRealE2E_DownloadFile(t *testing.T) {
 
 	if string(actualContent) != testContent {
 		t.Errorf("Downloaded content mismatch. Expected: %s, Got: %s", testContent, string(actualContent))
+	}
+}
+
+// TestRealE2E_DownloadLargeFile tests downloading a large file with chunked transfer
+func TestRealE2E_DownloadLargeFile(t *testing.T) {
+	// Setup server
+	server := setupTestServer(t)
+	defer server.cleanupTestServer(t)
+
+	// Create large test file on server (1MB)
+	testFilename := "large_download_test.bin"
+	fileSize := 1024 * 1024 // 1MB
+	testContent := make([]byte, fileSize)
+	for i := range testContent {
+		testContent[i] = byte(i % 256)
+	}
+	
+	serverFilePath := filepath.Join(server.tempDir, testFilename)
+	if err := os.WriteFile(serverFilePath, testContent, 0644); err != nil {
+		t.Fatalf("Failed to create large test file on server: %v", err)
+	}
+
+	// Setup client
+	client := setupTestClient(t, server)
+	defer client.cleanupTestClient(t)
+
+	// Create temporary file for download
+	tempFile := createTestTempFile(t, "")
+	defer os.Remove(tempFile)
+
+	// Test download
+	ctx := context.Background()
+	err := client.client.DownloadFile(ctx, testFilename, tempFile)
+	if err != nil {
+		t.Fatalf("DownloadFile failed: %v", err)
+	}
+
+	// Verify downloaded content
+	actualContent, err := os.ReadFile(tempFile)
+	if err != nil {
+		t.Fatalf("Failed to read downloaded file: %v", err)
+	}
+
+	// Verify file size
+	if len(actualContent) != len(testContent) {
+		t.Errorf("Downloaded file size mismatch. Expected: %d, Got: %d", len(testContent), len(actualContent))
+	}
+
+	// Verify content integrity
+	if !bytes.Equal(actualContent, testContent) {
+		t.Errorf("Downloaded content mismatch for large file")
+	}
+}
+
+// TestRealE2E_DownloadVeryLargeFile tests downloading a very large file with chunked transfer
+func TestRealE2E_DownloadVeryLargeFile(t *testing.T) {
+	// Setup server
+	server := setupTestServer(t)
+	defer server.cleanupTestServer(t)
+
+	// Create very large test file on server (10MB)
+	testFilename := "very_large_download_test.bin"
+	fileSize := 10 * 1024 * 1024 // 10MB
+	testContent := make([]byte, fileSize)
+	for i := range testContent {
+		testContent[i] = byte(i % 256)
+	}
+	
+	serverFilePath := filepath.Join(server.tempDir, testFilename)
+	if err := os.WriteFile(serverFilePath, testContent, 0644); err != nil {
+		t.Fatalf("Failed to create very large test file on server: %v", err)
+	}
+
+	// Setup client
+	client := setupTestClient(t, server)
+	defer client.cleanupTestClient(t)
+
+	// Create temporary file for download
+	tempFile := createTestTempFile(t, "")
+	defer os.Remove(tempFile)
+
+	// Test download with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	
+	err := client.client.DownloadFile(ctx, testFilename, tempFile)
+	if err != nil {
+		t.Fatalf("DownloadFile failed: %v", err)
+	}
+
+	// Verify downloaded content
+	actualContent, err := os.ReadFile(tempFile)
+	if err != nil {
+		t.Fatalf("Failed to read downloaded file: %v", err)
+	}
+
+	// Verify file size
+	if len(actualContent) != len(testContent) {
+		t.Errorf("Downloaded file size mismatch. Expected: %d, Got: %d", len(testContent), len(actualContent))
+	}
+
+	// Verify content integrity (sample check for performance)
+	if len(actualContent) > 0 && actualContent[0] != testContent[0] {
+		t.Errorf("Downloaded content mismatch at beginning of file")
+	}
+	
+	if len(actualContent) > 1000 && actualContent[1000] != testContent[1000] {
+		t.Errorf("Downloaded content mismatch at middle of file")
+	}
+	
+	if len(actualContent) > 1 && actualContent[len(actualContent)-1] != testContent[len(testContent)-1] {
+		t.Errorf("Downloaded content mismatch at end of file")
 	}
 }
 
