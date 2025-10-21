@@ -195,6 +195,7 @@ func main() {
 		Port:         config.Port,
 		ConfigFolder: config.ConfigFolder,
 		RootDir:      &config.RootDir,
+		Logger:       logger,
 	}
 
 	// Create server
@@ -209,7 +210,7 @@ func main() {
 
 	// Start server in a goroutine
 	go func() {
-		logger.Info("Starting server", 
+		logger.Info("Starting server",
 			zap.String("address", fmt.Sprintf("%s:%s", config.Host, config.Port)))
 		srv.Run()
 	}()

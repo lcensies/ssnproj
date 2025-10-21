@@ -3,6 +3,7 @@ package client
 import (
 	"bufio"
 	"context"
+	"crypto/rsa"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -13,9 +14,11 @@ import (
 )
 
 // RunClient starts the client and connects to the server
-func RunClient(ctx context.Context, host string, port string, logger *zap.Logger) error {
-	// Create client and connect
-	client, err := clientpkg.NewClient(ctx, host, port, logger)
+func RunClient(ctx context.Context, host string, port string, serverPubKey *rsa.PublicKey, logger *zap.Logger) error {
+	var client *clientpkg.Client
+	var err error
+
+	client, err = clientpkg.NewClient(ctx, host, port, serverPubKey, logger)
 	if err != nil {
 		return fmt.Errorf("failed to create client: %w", err)
 	}

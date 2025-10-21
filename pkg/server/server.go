@@ -19,6 +19,7 @@ type ServerConfig struct {
 	Port         string
 	ConfigFolder string
 	RootDir      *string
+	Logger       *zap.Logger
 }
 
 const defaultRootDir = "data"
@@ -46,6 +47,7 @@ type ConnectionHandler struct {
 	rsaKeyPair    *rsaUtil.RSAKeyPair
 	logger        *zap.Logger
 	cmdHandler    *CommandHandler
+	rootDir       *string
 }
 
 func (c *ConnectionHandler) SendSecureMessage(message *protocol.Message) error {
@@ -82,17 +84,21 @@ func NewConnectionHandler(
 		rsaKeyPair:    rsaKeyPair,
 		logger:        logger,
 		cmdHandler:    nil,
+		rootDir:       rootDir,
 	}
-	handler.cmdHandler = NewCommandHandler(handler, logger, rootDir)
+	// cmdHandler will be initialized after handshake when we have the AES key
 	return handler
 }
 
-func (handler *ConnectionHandler) handleHandshake(m *protocol.Message) error {
+func (handler *ConnectionHandler) handleHandshake(m *protocol.Message, rootDir *string) error {
 	handler.state = ConnectionStateHandshake
 
 	// Decrypt the AES key sent by the client
 	aesKey := rsaUtil.DecryptWithPrivateKey(m.Payload, handler.rsaKeyPair.Private)
 	handler.aesKey = aesKey
+
+	// Now that we have the AES key, initialize the command handler with it
+	handler.cmdHandler = NewCommandHandler(handler, handler.logger, rootDir, aesKey)
 
 	// Send confirmation response
 	response, err := protocol.NewMessage(protocol.MessageTypeResponse, []byte("handshake complete")).Serialize()
@@ -105,6 +111,7 @@ func (handler *ConnectionHandler) handleHandshake(m *protocol.Message) error {
 	}
 
 	handler.state = ConnectionStateAuthenticated
+	handler.logger.Info("Client authenticated", zap.String("remote_addr", handler.conn.RemoteAddr().String()))
 	return nil
 }
 
@@ -117,9 +124,9 @@ func (handler *ConnectionHandler) handleCommand(message *protocol.Message) error
 	return handler.cmdHandler.handle(command)
 }
 
-func (handler *ConnectionHandler) handleMessage(message *protocol.Message) error {
+func (handler *ConnectionHandler) handleMessage(message *protocol.Message, rootDir *string) error {
 	if message.Type == protocol.MessageTypeHandshake {
-		return handler.handleHandshake(message)
+		return handler.handleHandshake(message, rootDir)
 	}
 
 	// Only decrypt if we have an AES key (after handshake)
@@ -174,7 +181,9 @@ func (handler *ConnectionHandler) HandleRawRequest() {
 			}
 
 			// Process the complete message
-			err = handler.handleMessage(message)
+			// We need to pass rootDir from the server config
+			// For now, we'll store it in the handler during creation
+			err = handler.handleMessage(message, handler.rootDir)
 			if err != nil {
 				handler.logger.Error("Error handling message", zap.Error(err))
 				handler.conn.Close()
@@ -186,10 +195,15 @@ func (handler *ConnectionHandler) HandleRawRequest() {
 }
 
 func NewServer(config *ServerConfig) (*Server, error) {
-	// TODO: Use a proper logger
-	logger, err := zap.NewDevelopment()
-	if err != nil {
-		return nil, err
+	// Use the logger from config
+	logger := config.Logger
+	if logger == nil {
+		// Fallback to production logger if none provided
+		var err error
+		logger, err = zap.NewProduction()
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// Create root directory if it doesn't exist

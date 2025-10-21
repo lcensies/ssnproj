@@ -18,7 +18,9 @@ func createTestCommandHandler(t *testing.T, tempDir string) (*CommandHandler, *M
 	}
 
 	mockConn := &MockConnectionHandler{}
-	cmdHandler := NewCommandHandler(mockConn, logger, &tempDir)
+	// Generate a test AES key for the handler
+	testAESKey := make([]byte, 32) // 256-bit key
+	cmdHandler := NewCommandHandler(mockConn, logger, &tempDir, testAESKey)
 
 	return cmdHandler, mockConn
 }
@@ -28,12 +30,18 @@ func TestE2E_ListFiles(t *testing.T) {
 	tempDir := createTestTempDir(t)
 	defer cleanupTestTempDir(t, tempDir)
 
-	// Create test files
-	testFiles := []string{"file1.txt", "file2.txt", "file3.txt"}
-	createTestFiles(t, tempDir, testFiles)
-
 	// Create command handler
 	cmdHandler, mockConn := createTestCommandHandler(t, tempDir)
+
+	// Get client directory
+	clientDir, err := cmdHandler.getClientDir()
+	if err != nil {
+		t.Fatalf("Failed to get client directory: %v", err)
+	}
+
+	// Create test files in client directory
+	testFiles := []string{"file1.txt", "file2.txt", "file3.txt"}
+	createTestFiles(t, clientDir, testFiles)
 
 	// Test list files
 	command := &protocol.CommandMessage{
@@ -42,7 +50,7 @@ func TestE2E_ListFiles(t *testing.T) {
 		Data:     nil,
 	}
 
-	err := cmdHandler.handleList(command)
+	err = cmdHandler.handleList(command)
 	if err != nil {
 		t.Fatalf("handleList failed: %v", err)
 	}
@@ -109,8 +117,14 @@ func TestE2E_UploadFile(t *testing.T) {
 		t.Errorf("Expected success=true, got %v. Message: %s", respMsg.Success, respMsg.Message)
 	}
 
-	// Verify file was created
-	filePath := filepath.Join(tempDir, testFilename)
+	// Get client directory
+	clientDir, err := cmdHandler.getClientDir()
+	if err != nil {
+		t.Fatalf("Failed to get client directory: %v", err)
+	}
+
+	// Verify file was created in client directory
+	filePath := filepath.Join(clientDir, testFilename)
 	if _, err := os.Stat(filePath); os.IsNotExist(err) {
 		t.Errorf("File was not created: %s", filePath)
 	}
@@ -131,16 +145,22 @@ func TestE2E_DownloadFile(t *testing.T) {
 	tempDir := createTestTempDir(t)
 	defer cleanupTestTempDir(t, tempDir)
 
-	// Create test file
+	// Create command handler
+	cmdHandler, mockConn := createTestCommandHandler(t, tempDir)
+
+	// Get client directory
+	clientDir, err := cmdHandler.getClientDir()
+	if err != nil {
+		t.Fatalf("Failed to get client directory: %v", err)
+	}
+
+	// Create test file in client directory
 	testFilename := "download_test.txt"
 	testContent := "This is test content for download"
-	filePath := filepath.Join(tempDir, testFilename)
+	filePath := filepath.Join(clientDir, testFilename)
 	if err := os.WriteFile(filePath, []byte(testContent), 0644); err != nil {
 		t.Fatalf("Failed to create test file: %v", err)
 	}
-
-	// Create command handler
-	cmdHandler, mockConn := createTestCommandHandler(t, tempDir)
 
 	// Test download
 	command := &protocol.CommandMessage{
@@ -149,14 +169,14 @@ func TestE2E_DownloadFile(t *testing.T) {
 		Data:     nil,
 	}
 
-	err := cmdHandler.handleDownload(command)
+	err = cmdHandler.handleDownload(command)
 	if err != nil {
 		t.Fatalf("handleDownload failed: %v", err)
 	}
 
-	// Verify response
-	if len(mockConn.sentMessages) != 1 {
-		t.Fatalf("Expected 1 sent message, got %d", len(mockConn.sentMessages))
+	// Verify response (now includes both response and chunk messages)
+	if len(mockConn.sentMessages) < 2 {
+		t.Fatalf("Expected at least 2 sent messages (response + chunk), got %d", len(mockConn.sentMessages))
 	}
 
 	response := mockConn.sentMessages[0]
@@ -169,9 +189,15 @@ func TestE2E_DownloadFile(t *testing.T) {
 		t.Errorf("Expected success=true, got %v. Message: %s", respMsg.Success, respMsg.Message)
 	}
 
-	// Verify file content in response
-	if string(respMsg.Data) != testContent {
-		t.Errorf("Downloaded content mismatch. Expected: %s, Got: %s", testContent, string(respMsg.Data))
+	// Verify chunk data
+	chunkMsg := mockConn.sentMessages[1]
+	chunk, err := protocol.DeserializeChunkData(chunkMsg.Payload)
+	if err != nil {
+		t.Fatalf("Failed to deserialize chunk: %v", err)
+	}
+
+	if string(chunk.Data) != testContent {
+		t.Errorf("Downloaded content mismatch. Expected: %s, Got: %s", testContent, string(chunk.Data))
 	}
 }
 
@@ -180,10 +206,19 @@ func TestE2E_DeleteFile(t *testing.T) {
 	tempDir := createTestTempDir(t)
 	defer cleanupTestTempDir(t, tempDir)
 
-	// Create test file
+	// Create command handler
+	cmdHandler, mockConn := createTestCommandHandler(t, tempDir)
+
+	// Get client directory
+	clientDir, err := cmdHandler.getClientDir()
+	if err != nil {
+		t.Fatalf("Failed to get client directory: %v", err)
+	}
+
+	// Create test file in client directory
 	testFilename := "delete_test.txt"
 	testContent := "This file will be deleted"
-	filePath := filepath.Join(tempDir, testFilename)
+	filePath := filepath.Join(clientDir, testFilename)
 	if err := os.WriteFile(filePath, []byte(testContent), 0644); err != nil {
 		t.Fatalf("Failed to create test file: %v", err)
 	}
@@ -193,9 +228,6 @@ func TestE2E_DeleteFile(t *testing.T) {
 		t.Fatalf("Test file was not created: %s", filePath)
 	}
 
-	// Create command handler
-	cmdHandler, mockConn := createTestCommandHandler(t, tempDir)
-
 	// Test delete
 	command := &protocol.CommandMessage{
 		Command:  protocol.CommandDelete,
@@ -203,7 +235,7 @@ func TestE2E_DeleteFile(t *testing.T) {
 		Data:     nil,
 	}
 
-	err := cmdHandler.handleDelete(command)
+	err = cmdHandler.handleDelete(command)
 	if err != nil {
 		t.Fatalf("handleDelete failed: %v", err)
 	}
@@ -335,6 +367,11 @@ func TestE2E_CompleteWorkflow(t *testing.T) {
 		t.Fatalf("handleDownload failed: %v", err)
 	}
 
+	// Verify response and chunk
+	if len(mockConn.sentMessages) < 2 {
+		t.Fatalf("Expected at least 2 sent messages (response + chunk), got %d", len(mockConn.sentMessages))
+	}
+
 	response = mockConn.sentMessages[0]
 	respMsg, err = protocol.DeserializeResponse(response.Payload)
 	if err != nil {
@@ -345,9 +382,15 @@ func TestE2E_CompleteWorkflow(t *testing.T) {
 		t.Errorf("Expected success=true, got %v. Message: %s", respMsg.Success, respMsg.Message)
 	}
 
-	// Verify downloaded content
-	if string(respMsg.Data) != testContent {
-		t.Errorf("Downloaded content mismatch. Expected: %s, Got: %s", testContent, string(respMsg.Data))
+	// Verify downloaded content from chunk
+	chunkMsg := mockConn.sentMessages[1]
+	chunk, err := protocol.DeserializeChunkData(chunkMsg.Payload)
+	if err != nil {
+		t.Fatalf("Failed to deserialize chunk: %v", err)
+	}
+
+	if string(chunk.Data) != testContent {
+		t.Errorf("Downloaded content mismatch. Expected: %s, Got: %s", testContent, string(chunk.Data))
 	}
 
 	// Clear messages for next test

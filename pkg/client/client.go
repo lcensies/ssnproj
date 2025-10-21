@@ -44,7 +44,7 @@ type Client struct {
 }
 
 // NewClient creates a new client
-func NewClient(ctx context.Context, host string, port string, logger *zap.Logger) (*Client, error) {
+func NewClient(ctx context.Context, host string, port string, serverPubKey *rsa.PublicKey, logger *zap.Logger) (*Client, error) {
 	var dialer net.Dialer
 	conn, err := dialer.DialContext(ctx, "tcp", fmt.Sprintf("%s:%s", host, port))
 	if err != nil {
@@ -52,8 +52,9 @@ func NewClient(ctx context.Context, host string, port string, logger *zap.Logger
 	}
 
 	return &Client{
-		conn:   conn,
-		logger: logger,
+		conn:         conn,
+		logger:       logger,
+		serverPubKey: serverPubKey,
 	}, nil
 }
 
@@ -176,26 +177,7 @@ func (c *Client) ReceiveSecureMessage() (*protocol.Message, error) {
 func (c *Client) PerformHandshake(ctx context.Context) error {
 	c.logger.Info("Starting RSA handshake...")
 
-	// Step 1: Receive server's public key (only if not already loaded)
-	if c.serverPubKey == nil {
-		c.logger.Info("Waiting for server's public key...")
-		response, err := c.ReceiveMessage()
-		if err != nil {
-			return fmt.Errorf("failed to receive server public key: %w", err)
-		}
-
-		if response.Type != protocol.MessageTypeHandshake {
-			return fmt.Errorf("unexpected message type: %v (expected handshake)", response.Type)
-		}
-
-		// Parse server's public key
-		c.serverPubKey = rsautil.BytesToPublicKey(response.Payload)
-		c.logger.Info("Received server's public key")
-	} else {
-		c.logger.Info("Using pre-loaded server's public key")
-	}
-
-	// Step 2: Generate AES key
+	// Step 1: Generate AES key
 	aesKey, err := aesutil.GenerateKey()
 	if err != nil {
 		return fmt.Errorf("failed to generate AES key: %w", err)
@@ -203,11 +185,11 @@ func (c *Client) PerformHandshake(ctx context.Context) error {
 	c.aesKey = aesKey
 	c.logger.Info("Generated AES session key", zap.Int("key_length", len(c.aesKey)))
 
-	// Step 3: Encrypt AES key with server's public key
+	// Step 2: Encrypt AES key with server's public key
 	encryptedAESKey := rsautil.EncryptWithPublicKey(c.aesKey, c.serverPubKey)
 	c.logger.Info("Encrypted AES key with server's public key")
 
-	// Step 4: Send encrypted AES key to server
+	// Step 3: Send encrypted AES key to server
 	handshakeMsg := protocol.NewMessage(protocol.MessageTypeHandshake, encryptedAESKey)
 	if err := c.SendMessage(handshakeMsg); err != nil {
 		return fmt.Errorf("failed to send encrypted AES key: %w", err)
@@ -215,7 +197,7 @@ func (c *Client) PerformHandshake(ctx context.Context) error {
 
 	c.logger.Info("Sent encrypted AES key to server")
 
-	// Step 5: Wait for server's handshake confirmation
+	// Step 4: Wait for server's handshake confirmation
 	response, err := c.ReceiveMessage()
 	if err != nil {
 		return fmt.Errorf("failed to receive handshake confirmation: %w", err)

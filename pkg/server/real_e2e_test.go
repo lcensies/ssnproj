@@ -160,26 +160,41 @@ func TestRealE2E_ListFiles(t *testing.T) {
 	server := setupTestServer(t)
 	defer server.cleanupTestServer(t)
 
-	// Create test files on server
-	testFiles := []string{"file1.txt", "file2.txt", "file3.txt"}
-	createTestFiles(t, server.tempDir, testFiles)
-
 	// Setup client
 	client := setupTestClient(t, server)
 	defer client.cleanupTestClient(t)
 
-	// Test list files
 	ctx := context.Background()
+
+	// Upload test files through the client so they go to the correct client directory
+	testFiles := []string{"file1.txt", "file2.txt", "file3.txt"}
+	for _, filename := range testFiles {
+		// Create temp file with test content
+		tempFile := createTestTempFile(t, "test content for "+filename)
+		defer os.Remove(tempFile)
+
+		// Upload it
+		err := client.client.UploadFile(ctx, tempFile)
+		if err != nil {
+			t.Fatalf("Failed to upload %s: %v", filename, err)
+		}
+	}
+
+	// Test list files
 	fileList, err := client.client.ListFiles(ctx)
 	if err != nil {
 		t.Fatalf("ListFiles failed: %v", err)
 	}
 
-	// Verify all test files are listed
-	for _, filename := range testFiles {
-		if !strings.Contains(fileList, filename) {
-			t.Errorf("File list does not contain %s. List: %s", filename, fileList)
-		}
+	// Verify we got some files back (uploaded files will have temp names)
+	if fileList == "" {
+		t.Errorf("File list is empty, expected uploaded files")
+	}
+
+	// Verify we have the correct number of files
+	fileCount := len(strings.Split(strings.TrimSpace(fileList), "\n"))
+	if fileList != "" && fileCount != len(testFiles) {
+		t.Errorf("Expected %d files, got %d. List: %s", len(testFiles), fileCount, fileList)
 	}
 }
 
@@ -207,17 +222,29 @@ func TestRealE2E_UploadFile(t *testing.T) {
 		t.Fatalf("UploadFile failed: %v", err)
 	}
 
-	// Verify file was created on server (using the basename of the temp file)
-	expectedFilename := filepath.Base(tempFile)
-	serverFilePath := filepath.Join(server.tempDir, expectedFilename)
-	if _, err := os.Stat(serverFilePath); os.IsNotExist(err) {
-		t.Errorf("File was not created on server: %s", serverFilePath)
+	// Verify by listing files
+	fileList, err := client.client.ListFiles(ctx)
+	if err != nil {
+		t.Fatalf("ListFiles failed: %v", err)
 	}
 
-	// Verify file content
-	actualContent, err := os.ReadFile(serverFilePath)
+	expectedFilename := filepath.Base(tempFile)
+	if !strings.Contains(fileList, expectedFilename) {
+		t.Errorf("Uploaded file not found in list. Expected: %s, List: %s", expectedFilename, fileList)
+	}
+
+	// Verify by downloading the file back
+	downloadFile := createTestTempFile(t, "")
+	defer os.Remove(downloadFile)
+
+	err = client.client.DownloadFile(ctx, expectedFilename, downloadFile)
 	if err != nil {
-		t.Fatalf("Failed to read uploaded file: %v", err)
+		t.Fatalf("Failed to download uploaded file: %v", err)
+	}
+
+	actualContent, err := os.ReadFile(downloadFile)
+	if err != nil {
+		t.Fatalf("Failed to read downloaded file: %v", err)
 	}
 
 	if string(actualContent) != testContent {
@@ -231,31 +258,36 @@ func TestRealE2E_DownloadFile(t *testing.T) {
 	server := setupTestServer(t)
 	defer server.cleanupTestServer(t)
 
-	// Create test file on server
-	testFilename := "download_test.txt"
-	testContent := "This is test content for download"
-	serverFilePath := filepath.Join(server.tempDir, testFilename)
-	if err := os.WriteFile(serverFilePath, []byte(testContent), 0644); err != nil {
-		t.Fatalf("Failed to create test file on server: %v", err)
-	}
-
 	// Setup client
 	client := setupTestClient(t, server)
 	defer client.cleanupTestClient(t)
 
+	ctx := context.Background()
+
+	// First upload a file
+	testContent := "This is test content for download"
+	uploadFile := createTestTempFile(t, testContent)
+	defer os.Remove(uploadFile)
+
+	err := client.client.UploadFile(ctx, uploadFile)
+	if err != nil {
+		t.Fatalf("Failed to upload test file: %v", err)
+	}
+
+	testFilename := filepath.Base(uploadFile)
+
 	// Create temporary file for download
-	tempFile := createTestTempFile(t, "")
-	defer os.Remove(tempFile)
+	downloadFile := createTestTempFile(t, "")
+	defer os.Remove(downloadFile)
 
 	// Test download
-	ctx := context.Background()
-	err := client.client.DownloadFile(ctx, testFilename, tempFile)
+	err = client.client.DownloadFile(ctx, testFilename, downloadFile)
 	if err != nil {
 		t.Fatalf("DownloadFile failed: %v", err)
 	}
 
 	// Verify downloaded content
-	actualContent, err := os.ReadFile(tempFile)
+	actualContent, err := os.ReadFile(downloadFile)
 	if err != nil {
 		t.Fatalf("Failed to read downloaded file: %v", err)
 	}
@@ -271,36 +303,45 @@ func TestRealE2E_DownloadLargeFile(t *testing.T) {
 	server := setupTestServer(t)
 	defer server.cleanupTestServer(t)
 
-	// Create large test file on server (1MB)
-	testFilename := "large_download_test.bin"
+	// Setup client
+	client := setupTestClient(t, server)
+	defer client.cleanupTestClient(t)
+
+	ctx := context.Background()
+
+	// Create large test file (1MB)
 	fileSize := 1024 * 1024 // 1MB
 	testContent := make([]byte, fileSize)
 	for i := range testContent {
 		testContent[i] = byte(i % 256)
 	}
-	
-	serverFilePath := filepath.Join(server.tempDir, testFilename)
-	if err := os.WriteFile(serverFilePath, testContent, 0644); err != nil {
-		t.Fatalf("Failed to create large test file on server: %v", err)
+
+	// Upload the large file
+	uploadFile := createTestTempFile(t, "")
+	defer os.Remove(uploadFile)
+	if err := os.WriteFile(uploadFile, testContent, 0644); err != nil {
+		t.Fatalf("Failed to create large test file: %v", err)
 	}
 
-	// Setup client
-	client := setupTestClient(t, server)
-	defer client.cleanupTestClient(t)
+	err := client.client.UploadFile(ctx, uploadFile)
+	if err != nil {
+		t.Fatalf("Failed to upload large test file: %v", err)
+	}
+
+	testFilename := filepath.Base(uploadFile)
 
 	// Create temporary file for download
-	tempFile := createTestTempFile(t, "")
-	defer os.Remove(tempFile)
+	downloadFile := createTestTempFile(t, "")
+	defer os.Remove(downloadFile)
 
 	// Test download
-	ctx := context.Background()
-	err := client.client.DownloadFile(ctx, testFilename, tempFile)
+	err = client.client.DownloadFile(ctx, testFilename, downloadFile)
 	if err != nil {
 		t.Fatalf("DownloadFile failed: %v", err)
 	}
 
 	// Verify downloaded content
-	actualContent, err := os.ReadFile(tempFile)
+	actualContent, err := os.ReadFile(downloadFile)
 	if err != nil {
 		t.Fatalf("Failed to read downloaded file: %v", err)
 	}
@@ -322,38 +363,50 @@ func TestRealE2E_DownloadVeryLargeFile(t *testing.T) {
 	server := setupTestServer(t)
 	defer server.cleanupTestServer(t)
 
-	// Create very large test file on server (10MB)
-	testFilename := "very_large_download_test.bin"
+	// Setup client
+	client := setupTestClient(t, server)
+	defer client.cleanupTestClient(t)
+
+	// Create very large test file (10MB)
 	fileSize := 10 * 1024 * 1024 // 10MB
 	testContent := make([]byte, fileSize)
 	for i := range testContent {
 		testContent[i] = byte(i % 256)
 	}
-	
-	serverFilePath := filepath.Join(server.tempDir, testFilename)
-	if err := os.WriteFile(serverFilePath, testContent, 0644); err != nil {
-		t.Fatalf("Failed to create very large test file on server: %v", err)
+
+	// Upload the very large file
+	uploadFile := createTestTempFile(t, "")
+	defer os.Remove(uploadFile)
+	if err := os.WriteFile(uploadFile, testContent, 0644); err != nil {
+		t.Fatalf("Failed to create very large test file: %v", err)
 	}
 
-	// Setup client
-	client := setupTestClient(t, server)
-	defer client.cleanupTestClient(t)
-
-	// Create temporary file for download
-	tempFile := createTestTempFile(t, "")
-	defer os.Remove(tempFile)
-
-	// Test download with timeout
+	// Test upload with timeout
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	
-	err := client.client.DownloadFile(ctx, testFilename, tempFile)
+
+	err := client.client.UploadFile(ctx, uploadFile)
+	if err != nil {
+		t.Fatalf("Failed to upload very large test file: %v", err)
+	}
+
+	testFilename := filepath.Base(uploadFile)
+
+	// Create temporary file for download
+	downloadFile := createTestTempFile(t, "")
+	defer os.Remove(downloadFile)
+
+	// Test download with timeout
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel2()
+
+	err = client.client.DownloadFile(ctx2, testFilename, downloadFile)
 	if err != nil {
 		t.Fatalf("DownloadFile failed: %v", err)
 	}
 
 	// Verify downloaded content
-	actualContent, err := os.ReadFile(tempFile)
+	actualContent, err := os.ReadFile(downloadFile)
 	if err != nil {
 		t.Fatalf("Failed to read downloaded file: %v", err)
 	}
@@ -367,11 +420,11 @@ func TestRealE2E_DownloadVeryLargeFile(t *testing.T) {
 	if len(actualContent) > 0 && actualContent[0] != testContent[0] {
 		t.Errorf("Downloaded content mismatch at beginning of file")
 	}
-	
+
 	if len(actualContent) > 1000 && actualContent[1000] != testContent[1000] {
 		t.Errorf("Downloaded content mismatch at middle of file")
 	}
-	
+
 	if len(actualContent) > 1 && actualContent[len(actualContent)-1] != testContent[len(testContent)-1] {
 		t.Errorf("Downloaded content mismatch at end of file")
 	}
@@ -383,33 +436,46 @@ func TestRealE2E_DeleteFile(t *testing.T) {
 	server := setupTestServer(t)
 	defer server.cleanupTestServer(t)
 
-	// Create test file on server
-	testFilename := "delete_test.txt"
-	testContent := "This file will be deleted"
-	serverFilePath := filepath.Join(server.tempDir, testFilename)
-	if err := os.WriteFile(serverFilePath, []byte(testContent), 0644); err != nil {
-		t.Fatalf("Failed to create test file on server: %v", err)
-	}
-
-	// Verify file exists initially
-	if _, err := os.Stat(serverFilePath); os.IsNotExist(err) {
-		t.Fatalf("Test file was not created on server: %s", serverFilePath)
-	}
-
 	// Setup client
 	client := setupTestClient(t, server)
 	defer client.cleanupTestClient(t)
 
-	// Test delete
 	ctx := context.Background()
-	err := client.client.DeleteFile(ctx, testFilename)
+
+	// First upload a file
+	testContent := "This file will be deleted"
+	uploadFile := createTestTempFile(t, testContent)
+	defer os.Remove(uploadFile)
+
+	err := client.client.UploadFile(ctx, uploadFile)
+	if err != nil {
+		t.Fatalf("Failed to upload test file: %v", err)
+	}
+
+	testFilename := filepath.Base(uploadFile)
+
+	// Verify it's there
+	fileList, err := client.client.ListFiles(ctx)
+	if err != nil {
+		t.Fatalf("ListFiles failed: %v", err)
+	}
+	if !strings.Contains(fileList, testFilename) {
+		t.Fatalf("File not found after upload: %s", testFilename)
+	}
+
+	// Test delete
+	err = client.client.DeleteFile(ctx, testFilename)
 	if err != nil {
 		t.Fatalf("DeleteFile failed: %v", err)
 	}
 
-	// Verify file was deleted
-	if _, err := os.Stat(serverFilePath); !os.IsNotExist(err) {
-		t.Errorf("File %s still exists after deletion", serverFilePath)
+	// Verify file was deleted by checking list
+	fileList, err = client.client.ListFiles(ctx)
+	if err != nil {
+		t.Fatalf("ListFiles failed after delete: %v", err)
+	}
+	if strings.Contains(fileList, testFilename) {
+		t.Errorf("File still exists after deletion: %s", testFilename)
 	}
 }
 
@@ -550,33 +616,34 @@ func TestRealE2E_MultipleClients(t *testing.T) {
 	// Get the expected filename (basename of temp file)
 	expectedFilename := filepath.Base(tempFile)
 
-	// Client 2 lists files and should see the file uploaded by client 1
+	// Client 2 lists files - should NOT see client 1's files (isolated storage)
 	fileList, err := client2.client.ListFiles(ctx)
 	if err != nil {
 		t.Fatalf("Client 2 list failed: %v", err)
 	}
 
-	if !strings.Contains(fileList, expectedFilename) {
-		t.Errorf("Client 2 should see file uploaded by client 1. List: %s", fileList)
+	// Verify isolation: Client 2 should NOT see Client 1's files
+	if strings.Contains(fileList, expectedFilename) {
+		t.Errorf("Client 2 should NOT see file uploaded by client 1 (isolated storage). List: %s", fileList)
 	}
 
-	// Client 2 downloads the file
+	// Client 2 attempts to download client 1's file - should fail
 	downloadFile := createTestTempFile(t, "")
 	defer os.Remove(downloadFile)
 
 	err = client2.client.DownloadFile(ctx, expectedFilename, downloadFile)
-	if err != nil {
-		t.Fatalf("Client 2 download failed: %v", err)
+	if err == nil {
+		t.Errorf("Client 2 should NOT be able to download client 1's file (isolated storage)")
 	}
 
-	// Verify content
-	actualContent, err := os.ReadFile(downloadFile)
+	// Verify that client 1 can still access its own file
+	client1List, err := client1.client.ListFiles(ctx)
 	if err != nil {
-		t.Fatalf("Failed to read downloaded file: %v", err)
+		t.Fatalf("Client 1 list failed: %v", err)
 	}
 
-	if string(actualContent) != testContent {
-		t.Errorf("Downloaded content mismatch. Expected: %s, Got: %s", testContent, string(actualContent))
+	if !strings.Contains(client1List, expectedFilename) {
+		t.Errorf("Client 1 should see its own uploaded file. List: %s", client1List)
 	}
 }
 

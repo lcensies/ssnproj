@@ -1,8 +1,11 @@
 package server
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	protocol "github.com/lcensies/ssnproj/pkg/protocol"
@@ -14,33 +17,48 @@ type ConnectionSender interface {
 	SendSecureMessage(message *protocol.Message) error
 }
 
+const (
+	errPathValidationFailed = "Path validation failed"
+	errInvalidFilename      = "Invalid filename"
+)
+
+// Chunk size configuration for optimal performance
+const (
+	smallFileThreshold  = 256 * 1024      // 256 KB
+	mediumFileThreshold = 5 * 1024 * 1024 // 5 MB
+	smallChunkSize      = 64 * 1024       // 64 KB for small files
+	mediumChunkSize     = 128 * 1024      // 128 KB for medium files
+	largeChunkSize      = 256 * 1024      // 256 KB for large files
+	maxChunkSize        = 512 * 1024      // 512 KB maximum
+)
+
 type CommandHandler struct {
 	conn    ConnectionSender
 	logger  *zap.Logger
 	rootDir *string
+	aesKey  []byte
 }
 
-func NewCommandHandler(conn ConnectionSender, logger *zap.Logger, rootDirectory *string) *CommandHandler {
+func NewCommandHandler(conn ConnectionSender, logger *zap.Logger, rootDirectory *string, aesKey []byte) *CommandHandler {
 	return &CommandHandler{
 		conn:    conn,
 		logger:  logger,
 		rootDir: rootDirectory,
+		aesKey:  aesKey,
 	}
 }
 
 func (handler *CommandHandler) handleUpload(command *protocol.CommandMessage) error {
 	handler.logger.Info("Upload command received", zap.String("filename", command.Filename))
 
-	clientDir, err := handler.getClientDir()
+	// Validate and get safe path
+	filePath, err := handler.validatePath(command.Filename)
 	if err != nil {
-		responsePayload, _ := protocol.SerializeResponse(false, "Failed to get client directory", nil)
+		responsePayload, _ := protocol.SerializeResponse(false, errInvalidFilename, nil)
 		response := protocol.NewMessage(protocol.MessageTypeResponse, responsePayload)
 		handler.conn.SendSecureMessage(response)
 		return err
 	}
-
-	// Create the file path
-	filePath := clientDir + "/" + command.Filename
 
 	// Write the file data
 	err = os.WriteFile(filePath, command.Data, 0644)
@@ -63,16 +81,14 @@ func (handler *CommandHandler) handleUpload(command *protocol.CommandMessage) er
 func (handler *CommandHandler) handleDownload(command *protocol.CommandMessage) error {
 	handler.logger.Info("Download command received", zap.String("filename", command.Filename))
 
-	clientDir, err := handler.getClientDir()
+	// Validate and get safe path
+	filePath, err := handler.validatePath(command.Filename)
 	if err != nil {
-		responsePayload, _ := protocol.SerializeResponse(false, "Failed to get client directory", nil)
+		responsePayload, _ := protocol.SerializeResponse(false, errInvalidFilename, nil)
 		response := protocol.NewMessage(protocol.MessageTypeResponse, responsePayload)
 		handler.conn.SendSecureMessage(response)
 		return err
 	}
-
-	// Create the file path
-	filePath := clientDir + "/" + command.Filename
 
 	// Read the file data
 	fileData, err := os.ReadFile(filePath)
@@ -99,10 +115,25 @@ func (handler *CommandHandler) handleDownload(command *protocol.CommandMessage) 
 }
 
 // sendFileInChunks sends a file in chunks with progress information
+// Chunk size is dynamically determined based on file size for optimal performance
 func (handler *CommandHandler) sendFileInChunks(filename string, fileData []byte) error {
-	const chunkSize = 64 * 1024 // 64KB chunks
 	totalSize := uint64(len(fileData))
-	totalChunks := uint32((totalSize + chunkSize - 1) / chunkSize) // Round up division
+
+	// Determine optimal chunk size based on file size
+	var chunkSize uint32
+	switch {
+	case totalSize < smallFileThreshold:
+		// Small files: use smaller chunks or send in one piece
+		chunkSize = smallChunkSize
+	case totalSize < mediumFileThreshold:
+		// Medium files: use medium chunks
+		chunkSize = mediumChunkSize
+	default:
+		// Large files: use larger chunks for better throughput
+		chunkSize = largeChunkSize
+	}
+
+	totalChunks := uint32((totalSize + uint64(chunkSize) - 1) / uint64(chunkSize)) // Round up division
 
 	handler.logger.Info("Sending file in chunks",
 		zap.String("filename", filename),
@@ -155,7 +186,65 @@ func (handler *CommandHandler) sendFileInChunks(filename string, fileData []byte
 }
 
 func (handler *CommandHandler) getClientDir() (string, error) {
-	return *handler.rootDir, nil
+	// If no AES key yet (shouldn't happen after handshake), return root
+	if handler.aesKey == nil || len(handler.aesKey) == 0 {
+		return *handler.rootDir, nil
+	}
+
+	// Create a unique directory name based on SHA256 hash of AES key
+	hash := sha256.Sum256(handler.aesKey)
+	clientID := hex.EncodeToString(hash[:8]) // Use first 8 bytes (16 hex chars) for directory name
+	clientDir := filepath.Join(*handler.rootDir, clientID)
+
+	// Create client directory if it doesn't exist
+	if err := os.MkdirAll(clientDir, 0755); err != nil {
+		return "", fmt.Errorf("failed to create client directory: %w", err)
+	}
+
+	handler.logger.Debug("Using client directory", zap.String("clientID", clientID), zap.String("path", clientDir))
+	return clientDir, nil
+}
+
+// validatePath ensures the resolved path stays within the root directory
+func (handler *CommandHandler) validatePath(filename string) (string, error) {
+	// Reject empty filenames
+	if filename == "" {
+		return "", fmt.Errorf("filename cannot be empty")
+	}
+
+	// Reject absolute paths
+	if filepath.IsAbs(filename) {
+		return "", fmt.Errorf("absolute paths are not allowed")
+	}
+
+	// Get root directory
+	rootDir, err := handler.getClientDir()
+	if err != nil {
+		return "", err
+	}
+
+	// Get absolute path of root
+	absRoot, err := filepath.Abs(rootDir)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve root directory: %w", err)
+	}
+
+	// Build and clean the full path
+	fullPath := filepath.Join(absRoot, filename)
+	cleanPath := filepath.Clean(fullPath)
+
+	// Get absolute path of the clean path
+	absPath, err := filepath.Abs(cleanPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve file path: %w", err)
+	}
+
+	// Ensure the path is within root directory
+	if !strings.HasPrefix(absPath, absRoot+string(filepath.Separator)) && absPath != absRoot {
+		return "", fmt.Errorf("path traversal attempt detected")
+	}
+
+	return absPath, nil
 }
 
 func (handler *CommandHandler) handleList(command *protocol.CommandMessage) error {
@@ -196,16 +285,15 @@ func (handler *CommandHandler) handleList(command *protocol.CommandMessage) erro
 func (handler *CommandHandler) handleDelete(command *protocol.CommandMessage) error {
 	handler.logger.Info("Delete command received", zap.String("filename", command.Filename))
 
-	clientDir, err := handler.getClientDir()
+	// Validate and get safe path
+	filePath, err := handler.validatePath(command.Filename)
 	if err != nil {
-		responsePayload, _ := protocol.SerializeResponse(false, "Failed to get client directory", nil)
+		handler.logger.Warn(errPathValidationFailed, zap.String("filename", command.Filename), zap.Error(err))
+		responsePayload, _ := protocol.SerializeResponse(false, errInvalidFilename, nil)
 		response := protocol.NewMessage(protocol.MessageTypeResponse, responsePayload)
 		handler.conn.SendSecureMessage(response)
 		return err
 	}
-
-	// Create the file path
-	filePath := clientDir + "/" + command.Filename
 
 	// Check if file exists
 	if _, err := os.Stat(filePath); os.IsNotExist(err) {

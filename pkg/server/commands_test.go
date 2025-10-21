@@ -72,13 +72,21 @@ func TestHandleList(t *testing.T) {
 	logger := createTestLogger(t)
 	defer logger.Sync()
 
-	// Create test files
-	testFiles := []string{"file1.txt", "file2.txt", "file3.txt"}
-	createTestFiles(t, tempDir, testFiles)
-
 	// Create mock connection handler
 	mockConn := &MockConnectionHandler{}
-	cmdHandler := NewCommandHandler(mockConn, logger, &tempDir)
+	// Generate a test AES key for the handler
+	testAESKey := make([]byte, 32) // 256-bit key
+	cmdHandler := NewCommandHandler(mockConn, logger, &tempDir, testAESKey)
+
+	// Get client directory (will be created by getClientDir)
+	clientDir, err := cmdHandler.getClientDir()
+	if err != nil {
+		t.Fatalf("Failed to get client directory: %v", err)
+	}
+
+	// Create test files in client directory
+	testFiles := []string{"file1.txt", "file2.txt", "file3.txt"}
+	createTestFiles(t, clientDir, testFiles)
 
 	// Test handleList
 	command := &protocol.CommandMessage{
@@ -87,7 +95,7 @@ func TestHandleList(t *testing.T) {
 		Data:     nil,
 	}
 
-	err := cmdHandler.handleList(command)
+	err = cmdHandler.handleList(command)
 	if err != nil {
 		t.Fatalf("handleList failed: %v", err)
 	}
@@ -131,7 +139,15 @@ func TestHandleUpload(t *testing.T) {
 
 	// Create mock connection handler
 	mockConn := &MockConnectionHandler{}
-	cmdHandler := NewCommandHandler(mockConn, logger, &tempDir)
+	// Generate a test AES key for the handler
+	testAESKey := make([]byte, 32) // 256-bit key
+	cmdHandler := NewCommandHandler(mockConn, logger, &tempDir, testAESKey)
+
+	// Get client directory
+	clientDir, err := cmdHandler.getClientDir()
+	if err != nil {
+		t.Fatalf("Failed to get client directory: %v", err)
+	}
 
 	// Test data
 	filename := "test_upload.txt"
@@ -143,7 +159,7 @@ func TestHandleUpload(t *testing.T) {
 		Data:     fileContent,
 	}
 
-	err := cmdHandler.handleUpload(command)
+	err = cmdHandler.handleUpload(command)
 	if err != nil {
 		t.Fatalf("handleUpload failed: %v", err)
 	}
@@ -168,8 +184,8 @@ func TestHandleUpload(t *testing.T) {
 		t.Errorf("Expected success=true, got %v. Message: %s", respMsg.Success, respMsg.Message)
 	}
 
-	// Verify file was created
-	filePath := filepath.Join(tempDir, filename)
+	// Verify file was created in client directory
+	filePath := filepath.Join(clientDir, filename)
 	if _, err := os.Stat(filePath); os.IsNotExist(err) {
 		t.Errorf("File was not created: %s", filePath)
 	}
@@ -193,17 +209,25 @@ func TestHandleDownload(t *testing.T) {
 	logger := createTestLogger(t)
 	defer logger.Sync()
 
-	// Create test file
+	// Create mock connection handler
+	mockConn := &MockConnectionHandler{}
+	// Generate a test AES key for the handler
+	testAESKey := make([]byte, 32) // 256-bit key
+	cmdHandler := NewCommandHandler(mockConn, logger, &tempDir, testAESKey)
+
+	// Get client directory
+	clientDir, err := cmdHandler.getClientDir()
+	if err != nil {
+		t.Fatalf("Failed to get client directory: %v", err)
+	}
+
+	// Create test file in client directory
 	filename := "test_download.txt"
 	fileContent := []byte("This is test content for download")
-	filePath := filepath.Join(tempDir, filename)
+	filePath := filepath.Join(clientDir, filename)
 	if err := os.WriteFile(filePath, fileContent, 0644); err != nil {
 		t.Fatalf("Failed to create test file: %v", err)
 	}
-
-	// Create mock connection handler
-	mockConn := &MockConnectionHandler{}
-	cmdHandler := NewCommandHandler(mockConn, logger, &tempDir)
 
 	command := &protocol.CommandMessage{
 		Command:  protocol.CommandDownload,
@@ -211,23 +235,24 @@ func TestHandleDownload(t *testing.T) {
 		Data:     nil,
 	}
 
-	err := cmdHandler.handleDownload(command)
+	err = cmdHandler.handleDownload(command)
 	if err != nil {
 		t.Fatalf("handleDownload failed: %v", err)
 	}
 
-	// Verify response was sent
-	if len(mockConn.sentMessages) != 1 {
-		t.Fatalf("Expected 1 sent message, got %d", len(mockConn.sentMessages))
+	// Verify response was sent (now with chunks: 1 response + 1 chunk message)
+	if len(mockConn.sentMessages) < 2 {
+		t.Fatalf("Expected at least 2 sent messages (response + chunk), got %d", len(mockConn.sentMessages))
 	}
 
-	response := mockConn.sentMessages[0]
-	if response.Type != protocol.MessageTypeResponse {
-		t.Errorf("Expected response type %v, got %v", protocol.MessageTypeResponse, response.Type)
+	// Check initial response
+	initialResponse := mockConn.sentMessages[0]
+	if initialResponse.Type != protocol.MessageTypeResponse {
+		t.Errorf("Expected response type %v, got %v", protocol.MessageTypeResponse, initialResponse.Type)
 	}
 
-	// Deserialize response
-	respMsg, err := protocol.DeserializeResponse(response.Payload)
+	// Deserialize initial response
+	respMsg, err := protocol.DeserializeResponse(initialResponse.Payload)
 	if err != nil {
 		t.Fatalf("Failed to deserialize response: %v", err)
 	}
@@ -236,9 +261,20 @@ func TestHandleDownload(t *testing.T) {
 		t.Errorf("Expected success=true, got %v. Message: %s", respMsg.Success, respMsg.Message)
 	}
 
-	// Verify file content in response
-	if string(respMsg.Data) != string(fileContent) {
-		t.Errorf("Downloaded content mismatch. Expected: %s, Got: %s", string(fileContent), string(respMsg.Data))
+	// Verify chunk was sent
+	chunkMsg := mockConn.sentMessages[1]
+	if chunkMsg.Type != protocol.MessageTypeData {
+		t.Errorf("Expected data type %v, got %v", protocol.MessageTypeData, chunkMsg.Type)
+	}
+
+	chunk, err := protocol.DeserializeChunkData(chunkMsg.Payload)
+	if err != nil {
+		t.Fatalf("Failed to deserialize chunk: %v", err)
+	}
+
+	// Verify chunk data
+	if !bytes.Equal(chunk.Data, fileContent) {
+		t.Errorf("Downloaded content mismatch. Expected: %s, Got: %s", string(fileContent), string(chunk.Data))
 	}
 }
 
@@ -252,7 +288,9 @@ func TestHandleDownload_FileNotFound(t *testing.T) {
 
 	// Create mock connection handler
 	mockConn := &MockConnectionHandler{}
-	cmdHandler := NewCommandHandler(mockConn, logger, &tempDir)
+	// Generate a test AES key for the handler
+	testAESKey := make([]byte, 32) // 256-bit key
+	cmdHandler := NewCommandHandler(mockConn, logger, &tempDir, testAESKey)
 
 	command := &protocol.CommandMessage{
 		Command:  protocol.CommandDownload,
@@ -289,20 +327,28 @@ func TestHandleDownload_ChunkedTransfer(t *testing.T) {
 	logger := createTestLogger(t)
 	defer logger.Sync()
 
-	// Create a large test file (larger than chunk size)
+	// Create mock connection handler
+	mockConn := &MockConnectionHandler{}
+	// Generate a test AES key for the handler
+	testAESKey := make([]byte, 32) // 256-bit key
+	cmdHandler := NewCommandHandler(mockConn, logger, &tempDir, testAESKey)
+
+	// Get client directory
+	clientDir, err := cmdHandler.getClientDir()
+	if err != nil {
+		t.Fatalf("Failed to get client directory: %v", err)
+	}
+
+	// Create a large test file in client directory (larger than chunk size)
 	filename := "large_test_file.txt"
 	fileContent := make([]byte, 200*1024) // 200KB file
 	for i := range fileContent {
 		fileContent[i] = byte(i % 256)
 	}
-	filePath := filepath.Join(tempDir, filename)
+	filePath := filepath.Join(clientDir, filename)
 	if err := os.WriteFile(filePath, fileContent, 0644); err != nil {
 		t.Fatalf("Failed to create test file: %v", err)
 	}
-
-	// Create mock connection handler
-	mockConn := &MockConnectionHandler{}
-	cmdHandler := NewCommandHandler(mockConn, logger, &tempDir)
 
 	command := &protocol.CommandMessage{
 		Command:  protocol.CommandDownload,
@@ -310,7 +356,7 @@ func TestHandleDownload_ChunkedTransfer(t *testing.T) {
 		Data:     nil,
 	}
 
-	err := cmdHandler.handleDownload(command)
+	err = cmdHandler.handleDownload(command)
 	if err != nil {
 		t.Fatalf("handleDownload failed: %v", err)
 	}
@@ -341,7 +387,7 @@ func TestHandleDownload_ChunkedTransfer(t *testing.T) {
 		msg := mockConn.sentMessages[i]
 		if msg.Type == protocol.MessageTypeData {
 			chunkCount++
-			
+
 			// Deserialize chunk data
 			chunk, err := protocol.DeserializeChunkData(msg.Payload)
 			if err != nil {
@@ -394,10 +440,12 @@ func TestSendFileInChunks_SmallFile(t *testing.T) {
 	// Create a small test file (smaller than chunk size)
 	filename := "small_test_file.txt"
 	fileContent := []byte("This is a small file")
-	
+
 	// Create mock connection handler
 	mockConn := &MockConnectionHandler{}
-	cmdHandler := NewCommandHandler(mockConn, logger, &tempDir)
+	// Generate a test AES key for the handler
+	testAESKey := make([]byte, 32) // 256-bit key
+	cmdHandler := NewCommandHandler(mockConn, logger, &tempDir, testAESKey)
 
 	// Test sendFileInChunks directly
 	err := cmdHandler.sendFileInChunks(filename, fileContent)
@@ -451,10 +499,22 @@ func TestHandleDelete(t *testing.T) {
 	logger := createTestLogger(t)
 	defer logger.Sync()
 
-	// Create test file
+	// Create mock connection handler
+	mockConn := &MockConnectionHandler{}
+	// Generate a test AES key for the handler
+	testAESKey := make([]byte, 32) // 256-bit key
+	cmdHandler := NewCommandHandler(mockConn, logger, &tempDir, testAESKey)
+
+	// Get client directory
+	clientDir, err := cmdHandler.getClientDir()
+	if err != nil {
+		t.Fatalf("Failed to get client directory: %v", err)
+	}
+
+	// Create test file in client directory
 	filename := "test_delete.txt"
 	fileContent := []byte("This file will be deleted")
-	filePath := filepath.Join(tempDir, filename)
+	filePath := filepath.Join(clientDir, filename)
 	if err := os.WriteFile(filePath, fileContent, 0644); err != nil {
 		t.Fatalf("Failed to create test file: %v", err)
 	}
@@ -464,17 +524,13 @@ func TestHandleDelete(t *testing.T) {
 		t.Fatalf("Test file was not created: %s", filePath)
 	}
 
-	// Create mock connection handler
-	mockConn := &MockConnectionHandler{}
-	cmdHandler := NewCommandHandler(mockConn, logger, &tempDir)
-
 	command := &protocol.CommandMessage{
 		Command:  protocol.CommandDelete,
 		Filename: filename,
 		Data:     nil,
 	}
 
-	err := cmdHandler.handleDelete(command)
+	err = cmdHandler.handleDelete(command)
 	if err != nil {
 		t.Fatalf("handleDelete failed: %v", err)
 	}
@@ -515,7 +571,9 @@ func TestHandleDelete_FileNotFound(t *testing.T) {
 
 	// Create mock connection handler
 	mockConn := &MockConnectionHandler{}
-	cmdHandler := NewCommandHandler(mockConn, logger, &tempDir)
+	// Generate a test AES key for the handler
+	testAESKey := make([]byte, 32) // 256-bit key
+	cmdHandler := NewCommandHandler(mockConn, logger, &tempDir, testAESKey)
 
 	command := &protocol.CommandMessage{
 		Command:  protocol.CommandDelete,
