@@ -6,8 +6,17 @@ import (
 	"crypto/sha512"
 	"crypto/x509"
 	"encoding/pem"
+	"fmt"
 	"log"
+	"os"
 )
+
+type RSAKeyPair struct {
+	Private *rsa.PrivateKey
+	Public  *rsa.PublicKey
+}
+
+const defaultRsaKeySize = 2048
 
 // GenerateKeyPair generates a new key pair
 func GenerateKeyPair(bits int) (*rsa.PrivateKey, *rsa.PublicKey) {
@@ -107,4 +116,28 @@ func DecryptWithPrivateKey(ciphertext []byte, priv *rsa.PrivateKey) []byte {
 		log.Fatal(err)
 	}
 	return plaintext
+}
+
+func LoadKeypair(configFolder string) (*RSAKeyPair, error) {
+	if _, err := os.Stat(configFolder); os.IsNotExist(err) {
+		privKey, pubKey := GenerateKeyPair(defaultRsaKeySize)
+		return &RSAKeyPair{
+			Private: privKey,
+			Public:  pubKey,
+		}, nil
+	}
+	privKeyBytes, err := os.ReadFile(fmt.Sprintf("%s/private.pem", configFolder))
+	if err != nil {
+		return nil, err
+	}
+	pubKeyBytes, err := os.ReadFile(fmt.Sprintf("%s/public.pem", configFolder))
+	if err != nil {
+		return nil, err
+	}
+	privKey := BytesToPrivateKey(privKeyBytes)
+	pubKey := BytesToPublicKey(pubKeyBytes)
+	return &RSAKeyPair{
+		Private: privKey,
+		Public:  pubKey,
+	}, nil
 }

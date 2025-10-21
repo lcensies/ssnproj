@@ -5,6 +5,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+
+	aesUtil "github.com/lcensies/ssnproj/pkg/aes"
 )
 
 // Custom error types for message deserialization
@@ -61,6 +63,15 @@ func NewMessage(msgType MessageType, payload []byte) *Message {
 		Type:    msgType,
 		Payload: payload,
 	}
+}
+
+func (m *Message) Decrypt(aesKey []byte) error {
+	payload, err := aesUtil.Decrypt(m.Payload, aesKey)
+	if err != nil {
+		return err
+	}
+	m.Payload = payload
+	return nil
 }
 
 // Serialize converts a message to bytes
@@ -302,8 +313,10 @@ func DeserializeResponse(data []byte) (*ResponseMessage, error) {
 
 	// Read message
 	message := make([]byte, messageLen)
-	if _, err := buf.Read(message); err != nil {
-		return nil, err
+	if messageLen > 0 {
+		if _, err := buf.Read(message); err != nil {
+			return nil, err
+		}
 	}
 
 	// Read remaining data

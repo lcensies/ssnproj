@@ -2,26 +2,30 @@ package server
 
 import (
 	"bufio"
-	"crypto/rsa"
 	"fmt"
 	"io"
 	"log"
 	"net"
-	"os"
 
+	aesUtil "github.com/lcensies/ssnproj/pkg/aes"
 	protocol "github.com/lcensies/ssnproj/pkg/protocol"
-	rsaPkg "github.com/lcensies/ssnproj/pkg/rsa"
+	rsaUtil "github.com/lcensies/ssnproj/pkg/rsa"
+	"go.uber.org/zap"
 )
 
 type ServerConfig struct {
 	host         string
 	port         string
 	configFolder string
+	rootDir      *string
 }
+
+const defaultRootDir = "data"
 
 type Server struct {
 	config     *ServerConfig
-	rsaKeyPair *RSAKeyPair
+	rsaKeyPair *rsaUtil.RSAKeyPair
+	logger     *zap.Logger
 }
 
 type ConnectionState int
@@ -29,33 +33,104 @@ type ConnectionState int
 const (
 	ConnectionStateNew ConnectionState = iota
 	ConnectionStateHandshake
-	ConnectionStateAuthorized
+	ConnectionStateAuthenticated
 	ConnectionStateClosed
 )
-
-type RSAKeyPair struct {
-	privateKey *rsa.PrivateKey
-	publicKey  *rsa.PublicKey
-}
-
-const defaultRsaKeySize = 2048
 
 type ConnectionHandler struct {
 	conn          net.Conn
 	state         ConnectionState
 	messageBuffer *protocol.MessageBuffer
-	// aesKey *[]byte
+	aesKey        []byte
+	rsaKeyPair    *rsaUtil.RSAKeyPair
+	logger        *zap.Logger
+	cmdHandler    *CommandHandler
 }
 
-func NewConnectionHandler(conn net.Conn) *ConnectionHandler {
-	return &ConnectionHandler{
+func (c *ConnectionHandler) SendSecureMessage(message *protocol.Message) error {
+	// Encrypt the payload with AES
+	encryptedPayload, err := aesUtil.Encrypt(message.Payload, c.aesKey)
+	if err != nil {
+		return err
+	}
+
+	// Create message with encrypted payload
+	encryptedMsg := protocol.NewMessage(message.Type, encryptedPayload)
+	serializedMsg, err := encryptedMsg.Serialize()
+
+	if err != nil {
+		return err
+	}
+	_, err = c.conn.Write(serializedMsg)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func NewConnectionHandler(
+	conn net.Conn,
+	rsaKeyPair *rsaUtil.RSAKeyPair,
+	logger *zap.Logger,
+	rootDir *string) *ConnectionHandler {
+
+	handler := &ConnectionHandler{
 		conn:          conn,
 		state:         ConnectionStateNew,
 		messageBuffer: protocol.NewMessageBuffer(),
+		rsaKeyPair:    rsaKeyPair,
+		logger:        logger,
+		cmdHandler:    nil,
+	}
+	handler.cmdHandler = NewCommandHandler(handler, logger, rootDir)
+	return handler
+}
+
+func (handler *ConnectionHandler) handleHandshake(m *protocol.Message) error {
+	handler.state = ConnectionStateHandshake
+
+	aesKey, err := aesUtil.GenerateKey()
+	if err != nil {
+		return err
+	}
+	handler.aesKey = aesKey
+	encryptedAesKey := rsaUtil.EncryptWithPublicKey(aesKey, handler.rsaKeyPair.Public)
+	response, err := protocol.NewMessage(protocol.MessageTypeHandshake, encryptedAesKey).Serialize()
+	if err != nil {
+		return fmt.Errorf("error serializing response: %v", err)
+	}
+	handler.conn.Write(response)
+	return nil
+}
+
+func (handler *ConnectionHandler) handleCommand(message *protocol.Message) error {
+	command, err := protocol.DeserializeCommand(message.Payload)
+	if err != nil {
+		return err
+	}
+
+	return handler.cmdHandler.handle(command)
+}
+
+func (handler *ConnectionHandler) handleMessage(message *protocol.Message) error {
+
+	if message.Type == protocol.MessageTypeHandshake {
+		return handler.handleHandshake(message)
+	}
+	err := message.Decrypt(handler.aesKey)
+	if err != nil {
+		return err
+	}
+
+	switch message.Type {
+	case protocol.MessageTypeCommand:
+		return handler.handleCommand(message)
+	default:
+		return fmt.Errorf("Unexpected message type: %v", message.Type)
 	}
 }
 
-func (handler *ConnectionHandler) handleRequest() {
+func (handler *ConnectionHandler) handleRawRequest() {
 	reader := bufio.NewReader(handler.conn)
 	buffer := make([]byte, 1024)
 
@@ -64,7 +139,7 @@ func (handler *ConnectionHandler) handleRequest() {
 		n, err := reader.Read(buffer)
 		if err != nil {
 			if err != io.EOF {
-				fmt.Printf("Error reading from connection: %v\n", err)
+				handler.logger.Error("Error reading from connection", zap.Error(err))
 			}
 			handler.conn.Close()
 			return
@@ -83,73 +158,37 @@ func (handler *ConnectionHandler) handleRequest() {
 					break
 				}
 				// Other errors are actual problems
-				fmt.Printf("Error deserializing message: %v\n", err)
+				handler.logger.Error("Error deserializing message", zap.Error(err))
 				handler.conn.Close()
 				return
 			}
 
 			// Process the complete message
-			fmt.Printf("Message received - Type: %d, Payload: %s\n", message.Type, string(message.Payload))
-
-			// Send response
-			response, err := protocol.NewMessage(protocol.MessageTypeResponse, nil).Serialize()
+			err = handler.handleMessage(message)
 			if err != nil {
-				fmt.Printf("Error serializing response: %v\n", err)
+				handler.logger.Error("Error handling message", zap.Error(err))
 				handler.conn.Close()
 				return
 			}
 
-			if _, err := handler.conn.Write(response); err != nil {
-				fmt.Printf("Error writing response: %v\n", err)
-				handler.conn.Close()
-				return
-			}
-
-			// If there's no more data in the buffer, break out of the inner loop
-			if !handler.messageBuffer.HasData() {
-				break
-			}
 		}
 	}
 }
 
-func (handler *ConnectionHandler) performHandshake() {
-	handler.state = ConnectionStateHandshake
-	handler.conn.Write([]byte("Handshake complete.\n"))
-}
-
-func LoadKeypair(configFolder string) (*RSAKeyPair, error) {
-	if _, err := os.Stat(configFolder); os.IsNotExist(err) {
-		privKey, pubKey := rsaPkg.GenerateKeyPair(defaultRsaKeySize)
-		return &RSAKeyPair{
-			privateKey: privKey,
-			publicKey:  pubKey,
-		}, nil
-	}
-	privKeyBytes, err := os.ReadFile(fmt.Sprintf("%s/private.pem", configFolder))
-	if err != nil {
-		return nil, err
-	}
-	pubKeyBytes, err := os.ReadFile(fmt.Sprintf("%s/public.pem", configFolder))
-	if err != nil {
-		return nil, err
-	}
-	privKey := rsaPkg.BytesToPrivateKey(privKeyBytes)
-	pubKey := rsaPkg.BytesToPublicKey(pubKeyBytes)
-	return &RSAKeyPair{
-		privateKey: privKey,
-		publicKey:  pubKey,
-	}, nil
-}
-
 func NewServer(config *ServerConfig) (*Server, error) {
-	rsaKeyPair, err := LoadKeypair(config.configFolder)
+	// TODO: Use a proper logger
+	logger, err := zap.NewDevelopment()
+	if err != nil {
+		return nil, err
+	}
+	rsaKeyPair, err := rsaUtil.LoadKeypair(config.configFolder)
 	if err != nil {
 		return nil, err
 	}
 	return &Server{
 		config:     config,
 		rsaKeyPair: rsaKeyPair,
+		logger:     logger,
 	}, nil
 }
 
@@ -166,7 +205,7 @@ func (server *Server) Run() {
 			log.Fatal(err)
 		}
 
-		client := NewConnectionHandler(conn)
-		go client.handleRequest()
+		client := NewConnectionHandler(conn, server.rsaKeyPair, server.logger, server.config.rootDir)
+		go client.handleRawRequest()
 	}
 }
