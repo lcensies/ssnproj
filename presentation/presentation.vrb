@@ -1,0 +1,28 @@
+\frametitle{Demo: Interactive Session}
+\begin{lstlisting}[basicstyle=\ttfamily\tiny]
+$ ./bin/client -host localhost -port 8080
+
+Connected to server successfully!
+Handshake completed. Session secured with AES-256-GCM.
+
+Available commands: upload, download, list, delete, help, exit
+
+> upload test.txt
+File 'test.txt' uploaded successfully
+
+> list
+Files on server:
+test.txt
+
+> download test.txt output.txt
+Downloading file in chunks...
+[====================================] 100%
+File downloaded to 'output.txt' (1024 bytes)
+
+> delete test.txt
+Are you sure you want to delete 'test.txt'? (y/n): y
+File 'test.txt' deleted successfully
+
+> exit
+Goodbye!
+\end{lstlisting}

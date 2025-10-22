@@ -86,6 +86,7 @@ func NewConnectionHandler(
 		cmdHandler:    nil,
 		rootDir:       rootDir,
 	}
+
 	// cmdHandler will be initialized after handshake when we have the AES key
 	return handler
 }

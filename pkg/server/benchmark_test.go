@@ -4,9 +4,11 @@ import (
 	"context"
 	"crypto/rand"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	aesUtil "github.com/lcensies/ssnproj/pkg/aes"
 	entity "github.com/lcensies/ssnproj/pkg/client"
@@ -16,9 +18,10 @@ import (
 
 // Benchmark file sizes
 const (
-	smallFileSize  = 1024 * 10        // 10 KB
-	mediumFileSize = 1024 * 1024      // 1 MB
-	largeFileSize  = 1024 * 1024 * 10 // 10 MB
+	smallFileSize  = 1024 * 10          // 10 KB
+	mediumFileSize = 1024 * 1024        // 1 MB
+	largeFileSize  = 1024 * 1024 * 10   // 10 MB
+	hugeFileSize   = 1024 * 1024 * 1024 // 1 GB
 )
 
 // setupBenchmarkServer creates a server for benchmarking
@@ -314,17 +317,316 @@ func BenchmarkConcurrentClients(b *testing.B) {
 func BenchmarkFullUploadDownloadCycle(b *testing.B) {
 	ctx := context.Background()
 
-	// This is a placeholder - full E2E benchmark would require running server
-	// and connecting real client
-	b.Skip("Full E2E benchmark requires running server instance")
+	sizes := []struct {
+		name string
+		size int
+	}{
+		{"Small_10KB", smallFileSize},
+		{"Medium_1MB", mediumFileSize},
+		{"Large_10MB", largeFileSize},
+	}
 
-	// Setup would include:
-	// 1. Start server
-	// 2. Create client with proper handshake
-	// 3. Upload file
-	// 4. Download file
-	// 5. Verify integrity
+	for _, size := range sizes {
+		b.Run(size.name, func(b *testing.B) {
+			server, rootDir, cleanup := setupBenchmarkServer(b)
+			defer cleanup()
 
-	_ = ctx
-	_ = entity.NewClient
+			// Start server in background
+			listener, err := net.Listen("tcp", "localhost:0")
+			if err != nil {
+				b.Fatalf("Failed to create listener: %v", err)
+			}
+			defer listener.Close()
+
+			// Get the actual port
+			_, port, err := net.SplitHostPort(listener.Addr().String())
+			if err != nil {
+				b.Fatalf("Failed to get port: %v", err)
+			}
+
+			// Start server in goroutine
+			go func() {
+				for {
+					conn, err := listener.Accept()
+					if err != nil {
+						return // Listener closed
+					}
+					client := NewConnectionHandler(conn, server.rsaKeyPair, server.logger, rootDir)
+					go client.HandleRawRequest()
+				}
+			}()
+
+			// Create test file
+			testData := generateRandomData(size.size)
+			testFile := filepath.Join(os.TempDir(), fmt.Sprintf("bench_upload_%d.bin", size.size))
+			os.WriteFile(testFile, testData, 0644)
+			defer os.Remove(testFile)
+
+			// Create output file path
+			outputFile := filepath.Join(os.TempDir(), fmt.Sprintf("bench_download_%d.bin", size.size))
+			defer os.Remove(outputFile)
+
+			// Create public key file for client
+			pubKeyFile := filepath.Join(os.TempDir(), "server_public.pem")
+			pubKeyBytes := rsaUtil.PublicKeyToBytes(server.rsaKeyPair.Public)
+			os.WriteFile(pubKeyFile, pubKeyBytes, 0644)
+			defer os.Remove(pubKeyFile)
+
+			b.ResetTimer()
+			b.SetBytes(int64(size.size))
+
+			for i := 0; i < b.N; i++ {
+				// Create client with server's public key file
+				client, err := entity.NewClientWithServerPubKey(ctx, "localhost", port, pubKeyFile, zap.NewNop())
+				if err != nil {
+					b.Fatalf("Failed to create client: %v", err)
+				}
+
+				// Perform handshake
+				if err := client.PerformHandshake(ctx); err != nil {
+					client.Close(ctx)
+					b.Fatalf("Handshake failed: %v", err)
+				}
+
+				// Upload file
+				if err := client.UploadFile(ctx, testFile); err != nil {
+					client.Close(ctx)
+					b.Fatalf("Upload failed: %v", err)
+				}
+
+				// Download file
+				if err := client.DownloadFile(ctx, filepath.Base(testFile), outputFile); err != nil {
+					client.Close(ctx)
+					b.Fatalf("Download failed: %v", err)
+				}
+
+				// Verify file integrity
+				downloadedData, err := os.ReadFile(outputFile)
+				if err != nil {
+					client.Close(ctx)
+					b.Fatalf("Failed to read downloaded file: %v", err)
+				}
+
+				if len(downloadedData) != len(testData) {
+					client.Close(ctx)
+					b.Fatalf("File size mismatch: expected %d, got %d", len(testData), len(downloadedData))
+				}
+
+				// Close client
+				client.Close(ctx)
+			}
+		})
+	}
+}
+
+// BenchmarkLargeFileWithChunkSizes benchmarks large file transfer with different chunk sizes
+func BenchmarkLargeFileWithChunkSizes(b *testing.B) {
+	ctx := context.Background()
+
+	chunkSizes := []struct {
+		name string
+		size uint32
+	}{
+		{"16KB", 16 * 1024},
+		{"32KB", 32 * 1024},
+		{"64KB", 64 * 1024},
+		{"128KB", 128 * 1024},
+		{"256KB", 256 * 1024},
+		{"512KB", 512 * 1024},
+		{"1MB", 1024 * 1024},
+		{"2MB", 2 * 1024 * 1024},
+		{"4MB", 4 * 1024 * 1024},
+	}
+
+	for _, chunkSize := range chunkSizes {
+		b.Run(fmt.Sprintf("100MB_%s", chunkSize.name), func(b *testing.B) {
+			server, rootDir, cleanup := setupBenchmarkServer(b)
+			defer cleanup()
+
+			// Start server in background
+			listener, err := net.Listen("tcp", "localhost:0")
+			if err != nil {
+				b.Fatalf("Failed to create listener: %v", err)
+			}
+			defer listener.Close()
+
+			// Get the actual port
+			_, port, err := net.SplitHostPort(listener.Addr().String())
+			if err != nil {
+				b.Fatalf("Failed to get port: %v", err)
+			}
+
+			// Start server in goroutine
+			go func() {
+				for {
+					conn, err := listener.Accept()
+					if err != nil {
+						return // Listener closed
+					}
+					client := NewConnectionHandler(conn, server.rsaKeyPair, server.logger, rootDir)
+					go client.HandleRawRequest()
+				}
+			}()
+
+			// Create test file (100MB)
+			testFileSize := 100 * 1024 * 1024 // 100MB
+			testData := generateRandomData(testFileSize)
+			testFile := filepath.Join(os.TempDir(), fmt.Sprintf("bench_huge_%s.bin", chunkSize.name))
+			os.WriteFile(testFile, testData, 0644)
+			defer os.Remove(testFile)
+
+			// Create output file path
+			outputFile := filepath.Join(os.TempDir(), fmt.Sprintf("bench_download_%s.bin", chunkSize.name))
+			defer os.Remove(outputFile)
+
+			// Create public key file for client
+			pubKeyFile := filepath.Join(os.TempDir(), "server_public.pem")
+			pubKeyBytes := rsaUtil.PublicKeyToBytes(server.rsaKeyPair.Public)
+			os.WriteFile(pubKeyFile, pubKeyBytes, 0644)
+			defer os.Remove(pubKeyFile)
+
+			b.ResetTimer()
+			b.SetBytes(int64(testFileSize))
+
+			// Create client with server's public key file
+			client, err := entity.NewClientWithServerPubKey(ctx, "localhost", port, pubKeyFile, zap.NewNop())
+			if err != nil {
+				b.Fatalf("Failed to create client: %v", err)
+			}
+
+			// Perform handshake
+			if err := client.PerformHandshake(ctx); err != nil {
+				client.Close(ctx)
+				b.Fatalf("Handshake failed: %v", err)
+			}
+
+			// Upload file
+			start := time.Now()
+			if err := client.UploadFile(ctx, testFile); err != nil {
+				client.Close(ctx)
+				b.Fatalf("Upload failed: %v", err)
+			}
+			uploadTime := time.Since(start)
+
+			// Download file
+			start = time.Now()
+			if err := client.DownloadFile(ctx, filepath.Base(testFile), outputFile); err != nil {
+				client.Close(ctx)
+				b.Fatalf("Download failed: %v", err)
+			}
+			downloadTime := time.Since(start)
+
+			// Verify file integrity
+			downloadedData, err := os.ReadFile(outputFile)
+			if err != nil {
+				client.Close(ctx)
+				b.Fatalf("Failed to read downloaded file: %v", err)
+			}
+
+			if len(downloadedData) != len(testData) {
+				client.Close(ctx)
+				b.Fatalf("File size mismatch: expected %d, got %d", len(testData), len(downloadedData))
+			}
+
+			// Close client
+			client.Close(ctx)
+
+			// Log performance metrics
+			totalTime := uploadTime + downloadTime
+			throughput := float64(testFileSize) / totalTime.Seconds() / (1024 * 1024) // MB/s
+
+			b.Logf("Chunk size: %s, Upload: %v, Download: %v, Total: %v, Throughput: %.2f MB/s",
+				chunkSize.name, uploadTime, downloadTime, totalTime, throughput)
+		})
+	}
+}
+
+// BenchmarkLargeFileUploadOnly benchmarks only upload performance for large files
+func BenchmarkLargeFileUploadOnly(b *testing.B) {
+	ctx := context.Background()
+
+	fileSizes := []struct {
+		name string
+		size int
+	}{
+		{"100MB", 100 * 1024 * 1024},
+		{"500MB", 500 * 1024 * 1024},
+		{"1GB", 1024 * 1024 * 1024},
+	}
+
+	for _, fileSize := range fileSizes {
+		b.Run(fileSize.name, func(b *testing.B) {
+			server, rootDir, cleanup := setupBenchmarkServer(b)
+			defer cleanup()
+
+			// Start server in background
+			listener, err := net.Listen("tcp", "localhost:0")
+			if err != nil {
+				b.Fatalf("Failed to create listener: %v", err)
+			}
+			defer listener.Close()
+
+			// Get the actual port
+			_, port, err := net.SplitHostPort(listener.Addr().String())
+			if err != nil {
+				b.Fatalf("Failed to get port: %v", err)
+			}
+
+			// Start server in goroutine
+			go func() {
+				for {
+					conn, err := listener.Accept()
+					if err != nil {
+						return // Listener closed
+					}
+					client := NewConnectionHandler(conn, server.rsaKeyPair, server.logger, rootDir)
+					go client.HandleRawRequest()
+				}
+			}()
+
+			// Create test file
+			testData := generateRandomData(fileSize.size)
+			testFile := filepath.Join(os.TempDir(), fmt.Sprintf("bench_upload_%s.bin", fileSize.name))
+			os.WriteFile(testFile, testData, 0644)
+			defer os.Remove(testFile)
+
+			// Create public key file for client
+			pubKeyFile := filepath.Join(os.TempDir(), "server_public.pem")
+			pubKeyBytes := rsaUtil.PublicKeyToBytes(server.rsaKeyPair.Public)
+			os.WriteFile(pubKeyFile, pubKeyBytes, 0644)
+			defer os.Remove(pubKeyFile)
+
+			b.ResetTimer()
+			b.SetBytes(int64(fileSize.size))
+
+			// Create client with server's public key file
+			client, err := entity.NewClientWithServerPubKey(ctx, "localhost", port, pubKeyFile, zap.NewNop())
+			if err != nil {
+				b.Fatalf("Failed to create client: %v", err)
+			}
+
+			// Perform handshake
+			if err := client.PerformHandshake(ctx); err != nil {
+				client.Close(ctx)
+				b.Fatalf("Handshake failed: %v", err)
+			}
+
+			// Upload file
+			start := time.Now()
+			if err := client.UploadFile(ctx, testFile); err != nil {
+				client.Close(ctx)
+				b.Fatalf("Upload failed: %v", err)
+			}
+			uploadTime := time.Since(start)
+
+			// Close client
+			client.Close(ctx)
+
+			// Log performance metrics
+			throughput := float64(fileSize.size) / uploadTime.Seconds() / (1024 * 1024) // MB/s
+
+			b.Logf("File size: %s, Upload time: %v, Throughput: %.2f MB/s",
+				fileSize.name, uploadTime, throughput)
+		})
+	}
 }
